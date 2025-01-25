@@ -31,8 +31,8 @@ struct QuickTerminalTabItemView: View {
             Rectangle()
                 .fill(
                     isSelected && !isSingleTab
-                        ? Color(NSColor.windowBackgroundColor)
-                        : (isHovered ? Color(red: 42/255, green: 42/255, blue: 42/255) : Color(NSColor.controlBackgroundColor)))
+                        ? Color(NSColor.controlBackgroundColor)
+                        : (isHovered ? Color(NSColor.underPageBackgroundColor) : Color(NSColor.windowBackgroundColor)))
         )
         .onHover { hovering in
             isHovered = hovering
