@@ -1,6 +1,6 @@
 import SwiftUI
 
-struct TabItemView: View {
+struct QuickTerminalTabItemView: View {
     @ObservedObject var tab: QuickTerminalTab
     let isSelected: Bool
     let onSelect: () -> Void

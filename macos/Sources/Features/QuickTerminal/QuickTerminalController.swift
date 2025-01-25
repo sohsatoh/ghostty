@@ -135,7 +135,7 @@ class QuickTerminalController: BaseTerminalController {
         focusedSurface = leaf.surface
 
         let mainContent = VStack(spacing: 0) {
-            TabBarView(tabManager: tabManager)
+            QuickTerminalTabBarView(tabManager: tabManager)
             TerminalView(
                 ghostty: ghostty,
                 viewModel: self,

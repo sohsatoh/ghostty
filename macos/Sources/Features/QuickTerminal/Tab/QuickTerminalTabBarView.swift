@@ -1,6 +1,6 @@
 import SwiftUI
 
-struct TabBarView: View {
+struct QuickTerminalTabBarView: View {
     @ObservedObject var tabManager: QuickTerminalTabManager
     @GestureState private var isDragging: Bool = false
 
@@ -9,7 +9,7 @@ struct TabBarView: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 0) {
                     ForEach(tabManager.tabs) { tab in
-                        TabItemView(
+                        QuickTerminalTabItemView(
                             tab: tab,
                             isSelected: tab.isActive,
                             onSelect: { tabManager.selectTab(tab) },
@@ -21,7 +21,7 @@ struct TabBarView: View {
                         }
                         .onDrop(
                             of: [.text],
-                            delegate: TabDropDelegate(
+                            delegate: QuickTerminalTabDropDelegate(
                                 item: tab,
                                 tabManager: tabManager,
                                 currentTab: tabManager.draggedTab
@@ -55,7 +55,7 @@ struct TabBarView: View {
     }
 }
 
-struct TabDropDelegate: DropDelegate {
+struct QuickTerminalTabDropDelegate: DropDelegate {
     let item: QuickTerminalTab
     let tabManager: QuickTerminalTabManager
     let currentTab: QuickTerminalTab?
