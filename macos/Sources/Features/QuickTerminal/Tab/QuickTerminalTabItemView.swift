@@ -26,15 +26,14 @@ struct QuickTerminalTabItemView: View {
             .animation(.easeInOut, value: isHovered || isSelected)
         }
         .padding(.horizontal, 8)
-        .frame(height: 28)
+        .frame(height: 32)
         .background(
-            RoundedRectangle(cornerRadius: 6)
+            Rectangle()
                 .fill(
                     isSelected && !isSingleTab
-                        ? Color(NSColor.selectedContentBackgroundColor)
-                        : (isHovered ? Color(NSColor.gridColor) : Color.clear))
+                        ? Color(NSColor.windowBackgroundColor)
+                        : (isHovered ? Color(red: 42/255, green: 42/255, blue: 42/255) : Color(NSColor.controlBackgroundColor)))
         )
-        .padding(.horizontal, 2)
         .onHover { hovering in
             isHovered = hovering
         }

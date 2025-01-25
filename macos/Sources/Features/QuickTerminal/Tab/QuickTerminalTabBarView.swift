@@ -30,9 +30,10 @@ struct QuickTerminalTabBarView: View {
             }
 
             Divider()
+                .background(Color(NSColor.separatorColor))
 
             Image(systemName: "plus")
-                .foregroundColor(.gray)
+                .foregroundColor(Color(NSColor.secondaryLabelColor))
                 .padding(.horizontal, 8)
                 .frame(width: 50)
                 .contentShape(Rectangle())
@@ -43,7 +44,7 @@ struct QuickTerminalTabBarView: View {
                 .help("New Tab")
         }
         .frame(height: 32)
-        .background(Color(NSColor.windowBackgroundColor))
+        .background(Color(NSColor.controlBackgroundColor))
     }
 }
 
