@@ -68,7 +68,7 @@ class QuickTerminalController: BaseTerminalController {
             object: nil)
         center.addObserver(
             self,
-            selector: #selector(onNewTab(_:)),
+            selector: #selector(onNewTab),
             name: Ghostty.Notification.ghosttyNewTab,
             object: nil)
         center.addObserver(
@@ -539,7 +539,13 @@ class QuickTerminalController: BaseTerminalController {
         syncAppearance()
     }
 
-    @objc func onNewTab(_ sender: Any?) {
+    @objc func onNewTab(notification: SwiftUI.Notification) {
+        guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
+        guard let window = surfaceView.window else { return }
+
+        // return if window is not in our managed windows
+        guard window == self.window else { return }
+
         tabManager.newTab()
     }
 
