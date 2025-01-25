@@ -21,6 +21,7 @@ const renderer = @import("../renderer.zig");
 const math = @import("../math.zig");
 const Surface = @import("../Surface.zig");
 const link = @import("link.zig");
+const graphics = macos.graphics;
 const fgMode = @import("cell.zig").fgMode;
 const isCovering = @import("cell.zig").isCovering;
 const shadertoy = @import("shadertoy.zig");
@@ -105,10 +106,6 @@ default_cursor_color: ?terminal.color.RGB,
 /// foreground color as the cursor color.
 cursor_invert: bool,
 
-/// The current frame background color. This is only updated during
-/// the updateFrame method.
-current_background_color: terminal.color.RGB,
-
 /// The current set of cells to render. This is rebuilt on every frame
 /// but we keep this around so that we don't reallocate. Each set of
 /// cells goes into a separate shader.
@@ -150,6 +147,9 @@ layer: objc.Object, // CAMetalLayer
 /// with the display. This is void on platforms that don't support
 /// a display link.
 display_link: ?DisplayLink = null,
+
+/// The `CGColorSpace` that represents our current terminal color space
+terminal_colorspace: *graphics.ColorSpace,
 
 /// Custom shader state. This is only set if we have custom shaders.
 custom_shader_state: ?CustomShaderState = null,
@@ -390,6 +390,8 @@ pub const DerivedConfig = struct {
     custom_shaders: configpkg.RepeatablePath,
     links: link.Set,
     vsync: bool,
+    colorspace: configpkg.Config.WindowColorspace,
+    blending: configpkg.Config.TextBlending,
 
     pub fn init(
         alloc_gpa: Allocator,
@@ -460,7 +462,8 @@ pub const DerivedConfig = struct {
             .custom_shaders = custom_shaders,
             .links = links,
             .vsync = config.@"window-vsync",
-
+            .colorspace = config.@"window-colorspace",
+            .blending = config.@"text-blending",
             .arena = arena,
         };
     }
@@ -490,10 +493,6 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
 }
 
 pub fn init(alloc: Allocator, options: renderer.Options) !Metal {
-    var arena = ArenaAllocator.init(alloc);
-    defer arena.deinit();
-    const arena_alloc = arena.allocator();
-
     const ViewInfo = struct {
         view: objc.Object,
         scaleFactor: f64,
@@ -512,7 +511,7 @@ pub fn init(alloc: Allocator, options: renderer.Options) !Metal {
                 nswindow.getProperty(?*anyopaque, "contentView").?,
             );
             const scaleFactor = nswindow.getProperty(
-                macos.graphics.c.CGFloat,
+                graphics.c.CGFloat,
                 "backingScaleFactor",
             );
 
@@ -553,6 +552,40 @@ pub fn init(alloc: Allocator, options: renderer.Options) !Metal {
     layer.setProperty("opaque", options.config.background_opacity >= 1);
     layer.setProperty("displaySyncEnabled", options.config.vsync);
 
+    // Set our layer's pixel format appropriately.
+    layer.setProperty(
+        "pixelFormat",
+        // Using an `*_srgb` pixel format makes Metal gamma encode
+        // the pixels written to it *after* blending, which means
+        // we get linear alpha blending rather than gamma-incorrect
+        // blending.
+        if (options.config.blending.isLinear())
+            @intFromEnum(mtl.MTLPixelFormat.bgra8unorm_srgb)
+        else
+            @intFromEnum(mtl.MTLPixelFormat.bgra8unorm),
+    );
+
+    // Set our layer's color space to Display P3.
+    // This allows us to have "Apple-style" alpha blending,
+    // since it seems to be the case that Apple apps like
+    // Terminal and TextEdit render text in the display's
+    // color space using converted colors, which reduces,
+    // but does not fully eliminate blending artifacts.
+    const colorspace = try graphics.ColorSpace.createNamed(.displayP3);
+    defer colorspace.release();
+    layer.setProperty("colorspace", colorspace);
+
+    // Create a colorspace the represents our terminal colors
+    // this will allow us to create e.g. `CGColor`s for things
+    // like the current background color.
+    const terminal_colorspace = try graphics.ColorSpace.createNamed(
+        switch (options.config.colorspace) {
+            .@"display-p3" => .displayP3,
+            .srgb => .sRGB,
+        },
+    );
+    errdefer terminal_colorspace.release();
+
     // Make our view layer-backed with our Metal layer. On iOS views are
     // always layer backed so we don't need to do this. But on iOS the
     // caller MUST be sure to set the layerClass to CAMetalLayer.
@@ -577,54 +610,6 @@ pub fn init(alloc: Allocator, options: renderer.Options) !Metal {
         .features = options.config.font_features.items,
     });
     errdefer font_shaper.deinit();
-
-    // Load our custom shaders
-    const custom_shaders: []const [:0]const u8 = shadertoy.loadFromFiles(
-        arena_alloc,
-        options.config.custom_shaders,
-        .msl,
-    ) catch |err| err: {
-        log.warn("error loading custom shaders err={}", .{err});
-        break :err &.{};
-    };
-
-    // If we have custom shaders then setup our state
-    var custom_shader_state: ?CustomShaderState = state: {
-        if (custom_shaders.len == 0) break :state null;
-
-        // Build our sampler for our texture
-        var sampler = try mtl_sampler.Sampler.init(gpu_state.device);
-        errdefer sampler.deinit();
-
-        break :state .{
-            // Resolution and screen textures will be fixed up by first
-            // call to setScreenSize. Draw calls will bail out early if
-            // the screen size hasn't been set yet, so it won't error.
-            .front_texture = undefined,
-            .back_texture = undefined,
-            .sampler = sampler,
-            .uniforms = .{
-                .resolution = .{ 0, 0, 1 },
-                .time = 1,
-                .time_delta = 1,
-                .frame_rate = 1,
-                .frame = 1,
-                .channel_time = [1][4]f32{.{ 0, 0, 0, 0 }} ** 4,
-                .channel_resolution = [1][4]f32{.{ 0, 0, 0, 0 }} ** 4,
-                .mouse = .{ 0, 0, 0, 0 },
-                .date = .{ 0, 0, 0, 0 },
-                .sample_rate = 1,
-            },
-
-            .first_frame_time = try std.time.Instant.now(),
-            .last_frame_time = try std.time.Instant.now(),
-        };
-    };
-    errdefer if (custom_shader_state) |*state| state.deinit();
-
-    // Initialize our shaders
-    var shaders = try Shaders.init(alloc, gpu_state.device, custom_shaders);
-    errdefer shaders.deinit(alloc);
 
     // Initialize all the data that requires a critical font section.
     const font_critical: struct {
@@ -661,7 +646,6 @@ pub fn init(alloc: Allocator, options: renderer.Options) !Metal {
         .cursor_color = null,
         .default_cursor_color = options.config.cursor_color,
         .cursor_invert = options.config.cursor_invert,
-        .current_background_color = options.config.background,
 
         // Render state
         .cells = .{},
@@ -674,7 +658,16 @@ pub fn init(alloc: Allocator, options: renderer.Options) !Metal {
             .min_contrast = options.config.min_contrast,
             .cursor_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) },
             .cursor_color = undefined,
+            .bg_color = .{
+                options.config.background.r,
+                options.config.background.g,
+                options.config.background.b,
+                @intFromFloat(@round(options.config.background_opacity * 255.0)),
+            },
             .cursor_wide = false,
+            .use_display_p3 = options.config.colorspace == .@"display-p3",
+            .use_linear_blending = options.config.blending.isLinear(),
+            .use_experimental_linear_correction = options.config.blending == .@"linear-corrected",
         },
 
         // Fonts
@@ -682,15 +675,18 @@ pub fn init(alloc: Allocator, options: renderer.Options) !Metal {
         .font_shaper = font_shaper,
         .font_shaper_cache = font.ShaperCache.init(),
 
-        // Shaders
-        .shaders = shaders,
+        // Shaders (initialized below)
+        .shaders = undefined,
 
         // Metal stuff
         .layer = layer,
         .display_link = display_link,
-        .custom_shader_state = custom_shader_state,
+        .terminal_colorspace = terminal_colorspace,
+        .custom_shader_state = null,
         .gpu_state = gpu_state,
     };
+
+    try result.initShaders();
 
     // Do an initialize screen size setup to ensure our undefined values
     // above are initialized.
@@ -709,6 +705,8 @@ pub fn deinit(self: *Metal) void {
         }
     }
 
+    self.terminal_colorspace.release();
+
     self.cells.deinit(self.alloc);
 
     self.font_shaper.deinit();
@@ -723,11 +721,82 @@ pub fn deinit(self: *Metal) void {
     }
     self.image_placements.deinit(self.alloc);
 
+    self.deinitShaders();
+
+    self.* = undefined;
+}
+
+fn deinitShaders(self: *Metal) void {
     if (self.custom_shader_state) |*state| state.deinit();
 
     self.shaders.deinit(self.alloc);
+}
 
-    self.* = undefined;
+fn initShaders(self: *Metal) !void {
+    var arena = ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    // Load our custom shaders
+    const custom_shaders: []const [:0]const u8 = shadertoy.loadFromFiles(
+        arena_alloc,
+        self.config.custom_shaders,
+        .msl,
+    ) catch |err| err: {
+        log.warn("error loading custom shaders err={}", .{err});
+        break :err &.{};
+    };
+
+    var custom_shader_state: ?CustomShaderState = state: {
+        if (custom_shaders.len == 0) break :state null;
+
+        // Build our sampler for our texture
+        var sampler = try mtl_sampler.Sampler.init(self.gpu_state.device);
+        errdefer sampler.deinit();
+
+        break :state .{
+            // Resolution and screen textures will be fixed up by first
+            // call to setScreenSize. Draw calls will bail out early if
+            // the screen size hasn't been set yet, so it won't error.
+            .front_texture = undefined,
+            .back_texture = undefined,
+            .sampler = sampler,
+            .uniforms = .{
+                .resolution = .{ 0, 0, 1 },
+                .time = 1,
+                .time_delta = 1,
+                .frame_rate = 1,
+                .frame = 1,
+                .channel_time = [1][4]f32{.{ 0, 0, 0, 0 }} ** 4,
+                .channel_resolution = [1][4]f32{.{ 0, 0, 0, 0 }} ** 4,
+                .mouse = .{ 0, 0, 0, 0 },
+                .date = .{ 0, 0, 0, 0 },
+                .sample_rate = 1,
+            },
+
+            .first_frame_time = try std.time.Instant.now(),
+            .last_frame_time = try std.time.Instant.now(),
+        };
+    };
+    errdefer if (custom_shader_state) |*state| state.deinit();
+
+    var shaders = try Shaders.init(
+        self.alloc,
+        self.gpu_state.device,
+        custom_shaders,
+        // Using an `*_srgb` pixel format makes Metal gamma encode
+        // the pixels written to it *after* blending, which means
+        // we get linear alpha blending rather than gamma-incorrect
+        // blending.
+        if (self.config.blending.isLinear())
+            mtl.MTLPixelFormat.bgra8unorm_srgb
+        else
+            mtl.MTLPixelFormat.bgra8unorm,
+    );
+    errdefer shaders.deinit(self.alloc);
+
+    self.shaders = shaders;
+    self.custom_shader_state = custom_shader_state;
 }
 
 /// This is called just prior to spinning up the renderer thread for
@@ -977,19 +1046,6 @@ pub fn updateFrame(
             }
         }
 
-        // If our terminal screen size doesn't match our expected renderer
-        // size then we skip a frame. This can happen if the terminal state
-        // is resized between when the renderer mailbox is drained and when
-        // the state mutex is acquired inside this function.
-        //
-        // For some reason this doesn't seem to cause any significant issues
-        // with flickering while resizing. '\_('-')_/'
-        if (self.cells.size.rows != state.terminal.rows or
-            self.cells.size.columns != state.terminal.cols)
-        {
-            return;
-        }
-
         // Get the viewport pin so that we can compare it to the current.
         const viewport_pin = state.terminal.screen.pages.pin(.{ .viewport = .{} }).?;
 
@@ -1111,7 +1167,38 @@ pub fn updateFrame(
     self.cells_viewport = critical.viewport_pin;
 
     // Update our background color
-    self.current_background_color = critical.bg;
+    self.uniforms.bg_color = .{
+        critical.bg.r,
+        critical.bg.g,
+        critical.bg.b,
+        @intFromFloat(@round(self.config.background_opacity * 255.0)),
+    };
+
+    // Update the background color on our layer
+    //
+    // TODO: Is this expensive? Should we be checking if our
+    //       bg color has changed first before doing this work?
+    {
+        const color = graphics.c.CGColorCreate(
+            @ptrCast(self.terminal_colorspace),
+            &[4]f64{
+                @as(f64, @floatFromInt(critical.bg.r)) / 255.0,
+                @as(f64, @floatFromInt(critical.bg.g)) / 255.0,
+                @as(f64, @floatFromInt(critical.bg.b)) / 255.0,
+                self.config.background_opacity,
+            },
+        );
+        defer graphics.c.CGColorRelease(color);
+
+        // We use a CATransaction so that Core Animation knows that we
+        // updated the background color property. Otherwise it behaves
+        // weird, not updating the color until we resize.
+        const CATransaction = objc.getClass("CATransaction").?;
+        CATransaction.msgSend(void, "begin", .{});
+        defer CATransaction.msgSend(void, "commit", .{});
+
+        self.layer.setProperty("backgroundColor", color);
+    }
 
     // Go through our images and see if we need to setup any textures.
     {
@@ -1233,10 +1320,10 @@ pub fn drawFrame(self: *Metal, surface: *apprt.Surface) !void {
                 attachment.setProperty("storeAction", @intFromEnum(mtl.MTLStoreAction.store));
                 attachment.setProperty("texture", screen_texture.value);
                 attachment.setProperty("clearColor", mtl.MTLClearColor{
-                    .red = @as(f32, @floatFromInt(self.current_background_color.r)) / 255 * self.config.background_opacity,
-                    .green = @as(f32, @floatFromInt(self.current_background_color.g)) / 255 * self.config.background_opacity,
-                    .blue = @as(f32, @floatFromInt(self.current_background_color.b)) / 255 * self.config.background_opacity,
-                    .alpha = self.config.background_opacity,
+                    .red = 0.0,
+                    .green = 0.0,
+                    .blue = 0.0,
+                    .alpha = 0.0,
                 });
             }
 
@@ -1252,19 +1339,19 @@ pub fn drawFrame(self: *Metal, surface: *apprt.Surface) !void {
         defer encoder.msgSend(void, objc.sel("endEncoding"), .{});
 
         // Draw background images first
-        try self.drawImagePlacements(encoder, self.image_placements.items[0..self.image_bg_end]);
+        try self.drawImagePlacements(encoder, frame, self.image_placements.items[0..self.image_bg_end]);
 
         // Then draw background cells
         try self.drawCellBgs(encoder, frame);
 
         // Then draw images under text
-        try self.drawImagePlacements(encoder, self.image_placements.items[self.image_bg_end..self.image_text_end]);
+        try self.drawImagePlacements(encoder, frame, self.image_placements.items[self.image_bg_end..self.image_text_end]);
 
         // Then draw fg cells
         try self.drawCellFgs(encoder, frame, fg_count);
 
         // Then draw remaining images
-        try self.drawImagePlacements(encoder, self.image_placements.items[self.image_text_end..]);
+        try self.drawImagePlacements(encoder, frame, self.image_placements.items[self.image_text_end..]);
     }
 
     // If we have custom shaders, then we render them.
@@ -1457,6 +1544,7 @@ fn drawPostShader(
 fn drawImagePlacements(
     self: *Metal,
     encoder: objc.Object,
+    frame: *const FrameState,
     placements: []const mtl_image.Placement,
 ) !void {
     if (placements.len == 0) return;
@@ -1468,15 +1556,16 @@ fn drawImagePlacements(
         .{self.shaders.image_pipeline.value},
     );
 
-    // Set our uniform, which is the only shared buffer
+    // Set our uniforms
     encoder.msgSend(
         void,
-        objc.sel("setVertexBytes:length:atIndex:"),
-        .{
-            @as(*const anyopaque, @ptrCast(&self.uniforms)),
-            @as(c_ulong, @sizeOf(@TypeOf(self.uniforms))),
-            @as(c_ulong, 1),
-        },
+        objc.sel("setVertexBuffer:offset:atIndex:"),
+        .{ frame.uniforms.buffer.value, @as(c_ulong, 0), @as(c_ulong, 1) },
+    );
+    encoder.msgSend(
+        void,
+        objc.sel("setFragmentBuffer:offset:atIndex:"),
+        .{ frame.uniforms.buffer.value, @as(c_ulong, 0), @as(c_ulong, 1) },
     );
 
     for (placements) |placement| {
@@ -1590,6 +1679,11 @@ fn drawCellBgs(
     // Set our buffers
     encoder.msgSend(
         void,
+        objc.sel("setVertexBuffer:offset:atIndex:"),
+        .{ frame.uniforms.buffer.value, @as(c_ulong, 0), @as(c_ulong, 1) },
+    );
+    encoder.msgSend(
+        void,
         objc.sel("setFragmentBuffer:offset:atIndex:"),
         .{ frame.cells_bg.buffer.value, @as(c_ulong, 0), @as(c_ulong, 0) },
     );
@@ -1647,18 +1741,17 @@ fn drawCellFgs(
     encoder.msgSend(
         void,
         objc.sel("setFragmentTexture:atIndex:"),
-        .{
-            frame.grayscale.value,
-            @as(c_ulong, 0),
-        },
+        .{ frame.grayscale.value, @as(c_ulong, 0) },
     );
     encoder.msgSend(
         void,
         objc.sel("setFragmentTexture:atIndex:"),
-        .{
-            frame.color.value,
-            @as(c_ulong, 1),
-        },
+        .{ frame.color.value, @as(c_ulong, 1) },
+    );
+    encoder.msgSend(
+        void,
+        objc.sel("setFragmentBuffer:offset:atIndex:"),
+        .{ frame.uniforms.buffer.value, @as(c_ulong, 0), @as(c_ulong, 2) },
     );
 
     encoder.msgSend(
@@ -2003,17 +2096,73 @@ pub fn changeConfig(self: *Metal, config: *DerivedConfig) !void {
     // Set our new minimum contrast
     self.uniforms.min_contrast = config.min_contrast;
 
+    // Set our new color space and blending
+    self.uniforms.use_display_p3 = config.colorspace == .@"display-p3";
+    self.uniforms.use_linear_blending = config.blending.isLinear();
+    self.uniforms.use_experimental_linear_correction = config.blending == .@"linear-corrected";
+
     // Set our new colors
     self.default_background_color = config.background;
     self.default_foreground_color = config.foreground;
     self.default_cursor_color = if (!config.cursor_invert) config.cursor_color else null;
     self.cursor_invert = config.cursor_invert;
 
+    // Update our layer's opaqueness and display sync in case they changed.
+    {
+        // We use a CATransaction so that Core Animation knows that we
+        // updated the opaque property. Otherwise it behaves weird, not
+        // properly going from opaque to transparent unless we resize.
+        const CATransaction = objc.getClass("CATransaction").?;
+        CATransaction.msgSend(void, "begin", .{});
+        defer CATransaction.msgSend(void, "commit", .{});
+
+        self.layer.setProperty("opaque", config.background_opacity >= 1);
+        self.layer.setProperty("displaySyncEnabled", config.vsync);
+    }
+
+    // Update our terminal colorspace if it changed
+    if (self.config.colorspace != config.colorspace) {
+        const terminal_colorspace = try graphics.ColorSpace.createNamed(
+            switch (config.colorspace) {
+                .@"display-p3" => .displayP3,
+                .srgb => .sRGB,
+            },
+        );
+        errdefer terminal_colorspace.release();
+        self.terminal_colorspace.release();
+        self.terminal_colorspace = terminal_colorspace;
+    }
+
+    const old_blending = self.config.blending;
+    const old_custom_shaders = self.config.custom_shaders;
+
     self.config.deinit();
     self.config = config.*;
 
     // Reset our viewport to force a rebuild, in case of a font change.
     self.cells_viewport = null;
+
+    // We reinitialize our shaders if our
+    // blending or custom shaders changed.
+    if (old_blending != config.blending or
+        !old_custom_shaders.equal(config.custom_shaders))
+    {
+        self.deinitShaders();
+        try self.initShaders();
+        // We call setScreenSize to reinitialize
+        // the textures used for custom shaders.
+        if (self.custom_shader_state != null) {
+            try self.setScreenSize(self.size);
+        }
+        // And we update our layer's pixel format appropriately.
+        self.layer.setProperty(
+            "pixelFormat",
+            if (config.blending.isLinear())
+                @intFromEnum(mtl.MTLPixelFormat.bgra8unorm_srgb)
+            else
+                @intFromEnum(mtl.MTLPixelFormat.bgra8unorm),
+        );
+    }
 }
 
 /// Resize the screen.
@@ -2057,7 +2206,7 @@ pub fn setScreenSize(
     }
 
     // Set the size of the drawable surface to the bounds
-    self.layer.setProperty("drawableSize", macos.graphics.Size{
+    self.layer.setProperty("drawableSize", graphics.Size{
         .width = @floatFromInt(size.screen.width),
         .height = @floatFromInt(size.screen.height),
     });
@@ -2089,7 +2238,11 @@ pub fn setScreenSize(
         .min_contrast = old.min_contrast,
         .cursor_pos = old.cursor_pos,
         .cursor_color = old.cursor_color,
+        .bg_color = old.bg_color,
         .cursor_wide = old.cursor_wide,
+        .use_display_p3 = old.use_display_p3,
+        .use_linear_blending = old.use_linear_blending,
+        .use_experimental_linear_correction = old.use_experimental_linear_correction,
     };
 
     // Reset our cell contents if our grid size has changed.
@@ -2124,7 +2277,17 @@ pub fn setScreenSize(
                 const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
                 break :init id_init;
             };
-            desc.setProperty("pixelFormat", @intFromEnum(mtl.MTLPixelFormat.bgra8unorm));
+            desc.setProperty(
+                "pixelFormat",
+                // Using an `*_srgb` pixel format makes Metal gamma encode
+                // the pixels written to it *after* blending, which means
+                // we get linear alpha blending rather than gamma-incorrect
+                // blending.
+                if (self.config.blending.isLinear())
+                    @intFromEnum(mtl.MTLPixelFormat.bgra8unorm_srgb)
+                else
+                    @intFromEnum(mtl.MTLPixelFormat.bgra8unorm),
+            );
             desc.setProperty("width", @as(c_ulong, @intCast(size.screen.width)));
             desc.setProperty("height", @as(c_ulong, @intCast(size.screen.height)));
             desc.setProperty(
@@ -2154,7 +2317,17 @@ pub fn setScreenSize(
                 const id_init = id_alloc.msgSend(objc.Object, objc.sel("init"), .{});
                 break :init id_init;
             };
-            desc.setProperty("pixelFormat", @intFromEnum(mtl.MTLPixelFormat.bgra8unorm));
+            desc.setProperty(
+                "pixelFormat",
+                // Using an `*_srgb` pixel format makes Metal gamma encode
+                // the pixels written to it *after* blending, which means
+                // we get linear alpha blending rather than gamma-incorrect
+                // blending.
+                if (self.config.blending.isLinear())
+                    @intFromEnum(mtl.MTLPixelFormat.bgra8unorm_srgb)
+                else
+                    @intFromEnum(mtl.MTLPixelFormat.bgra8unorm),
+            );
             desc.setProperty("width", @as(c_ulong, @intCast(size.screen.width)));
             desc.setProperty("height", @as(c_ulong, @intCast(size.screen.height)));
             desc.setProperty(
@@ -2251,12 +2424,22 @@ fn rebuildCells(
         }
     }
 
-    // Go row-by-row to build the cells. We go row by row because we do
-    // font shaping by row. In the future, we will also do dirty tracking
-    // by row.
+    // We rebuild the cells row-by-row because we
+    // do font shaping and dirty tracking by row.
     var row_it = screen.pages.rowIterator(.left_up, .{ .viewport = .{} }, null);
-    var y: terminal.size.CellCountInt = screen.pages.rows;
+    // If our cell contents buffer is shorter than the screen viewport,
+    // we render the rows that fit, starting from the bottom. If instead
+    // the viewport is shorter than the cell contents buffer, we align
+    // the top of the viewport with the top of the contents buffer.
+    var y: terminal.size.CellCountInt = @min(
+        screen.pages.rows,
+        self.cells.size.rows,
+    );
     while (row_it.next()) |row| {
+        // The viewport may have more rows than our cell contents,
+        // so we need to break from the loop early if we hit y = 0.
+        if (y == 0) break;
+
         y -= 1;
 
         if (!rebuild) {
@@ -2315,7 +2498,11 @@ fn rebuildCells(
         var shaper_cells: ?[]const font.shape.Cell = null;
         var shaper_cells_i: usize = 0;
 
-        const row_cells = row.cells(.all);
+        const row_cells_all = row.cells(.all);
+
+        // If our viewport is wider than our cell contents buffer,
+        // we still only process cells up to the width of the buffer.
+        const row_cells = row_cells_all[0..@min(row_cells_all.len, self.cells.size.columns)];
 
         for (row_cells, 0..) |*cell, x| {
             // If this cell falls within our preedit range then we
@@ -2466,8 +2653,10 @@ fn rebuildCells(
             // Foreground alpha for this cell.
             const alpha: u8 = if (style.flags.faint) 175 else 255;
 
-            // If the cell has a background color, set it.
-            if (bg) |rgb| {
+            // Set the cell's background color.
+            {
+                const rgb = bg orelse self.background_color orelse self.default_background_color;
+
                 // Determine our background alpha. If we have transparency configured
                 // then this is dynamic depending on some situations. This is all
                 // in an attempt to make transparency look the best for various
@@ -2477,23 +2666,19 @@ fn rebuildCells(
 
                     if (self.config.background_opacity >= 1) break :bg_alpha default;
 
-                    // If we're selected, we do not apply background opacity
+                    // Cells that are selected should be fully opaque.
                     if (selected) break :bg_alpha default;
 
-                    // If we're reversed, do not apply background opacity
+                    // Cells that are reversed should be fully opaque.
                     if (style.flags.inverse) break :bg_alpha default;
 
-                    // If we have a background and its not the default background
-                    // then we apply background opacity
-                    if (style.bg(cell, color_palette) != null and !rgb.eql(self.background_color orelse self.default_background_color)) {
+                    // Cells that have an explicit bg color should be fully opaque.
+                    if (bg_style != null) {
                         break :bg_alpha default;
                     }
 
-                    // We apply background opacity.
-                    var bg_alpha: f64 = @floatFromInt(default);
-                    bg_alpha *= self.config.background_opacity;
-                    bg_alpha = @ceil(bg_alpha);
-                    break :bg_alpha @intFromFloat(bg_alpha);
+                    // Otherwise, we use the configured background opacity.
+                    break :bg_alpha @intFromFloat(@round(self.config.background_opacity * 255.0));
                 };
 
                 self.cells.bgCell(y, x).* = .{

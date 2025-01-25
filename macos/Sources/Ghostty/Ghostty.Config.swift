@@ -132,15 +132,6 @@ extension Ghostty {
             return v
         }
 
-        var windowColorspace: String {
-            guard let config = self.config else { return "" }
-            var v: UnsafePointer<Int8>? = nil
-            let key = "window-colorspace"
-            guard ghostty_config_get(config, &v, key, UInt(key.count)) else { return "" }
-            guard let ptr = v else { return "" }
-            return String(cString: ptr)
-        }
-
         var windowSaveState: String {
             guard let config = self.config else { return "" }
             var v: UnsafePointer<Int8>? = nil
@@ -174,11 +165,14 @@ extension Ghostty {
         }
 
         var windowDecorations: Bool {
-            guard let config = self.config else { return true }
-            var v = false;
+            let defaultValue = true
+            guard let config = self.config else { return defaultValue }
+            var v: UnsafePointer<Int8>? = nil
             let key = "window-decoration"
-            _ = ghostty_config_get(config, &v, key, UInt(key.count))
-            return v;
+            guard ghostty_config_get(config, &v, key, UInt(key.count)) else { return defaultValue }
+            guard let ptr = v else { return defaultValue }
+            let str = String(cString: ptr)
+            return WindowDecoration(rawValue: str)?.enabled() ?? defaultValue
         }
 
         var windowTheme: String? {
@@ -345,7 +339,7 @@ extension Ghostty {
         var backgroundBlurRadius: Int {
             guard let config = self.config else { return 1 }
             var v: Int = 0
-            let key = "background-blur-radius"
+            let key = "background-blur"
             _ = ghostty_config_get(config, &v, key, UInt(key.count))
             return v;
         }
@@ -560,6 +554,20 @@ extension Ghostty.Config {
             switch (self) {
             case .top_right, .bottom_right: return true;
             default: return false;
+            }
+        }
+    }
+
+    enum WindowDecoration: String {
+        case none
+        case client
+        case server
+        case auto
+
+        func enabled() -> Bool {
+            switch self {
+            case .client, .server, .auto: return true
+            case .none: return false
             }
         }
     }

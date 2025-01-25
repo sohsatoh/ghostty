@@ -27,6 +27,9 @@ class QuickTerminalController: BaseTerminalController {
     // The active space when the quick terminal was last shown.
     private var previousActiveSpace: size_t = 0
 
+    /// Non-nil if we have hidden dock state.
+    private var hiddenDock: HiddenDock? = nil
+
     /// The configuration derived from the Ghostty config so we don't need to rely on references.
     private var derivedConfig: DerivedConfig
 
@@ -48,6 +51,11 @@ class QuickTerminalController: BaseTerminalController {
 
         // Setup our notifications for behaviors
         let center = NotificationCenter.default
+        center.addObserver(
+            self,
+            selector: #selector(applicationWillTerminate(_:)),
+            name: NSApplication.willTerminateNotification,
+            object: nil)
         center.addObserver(
             self,
             selector: #selector(onToggleFullscreen),
@@ -83,6 +91,9 @@ class QuickTerminalController: BaseTerminalController {
         // Remove all of our notificationcenter subscriptions
         let center = NotificationCenter.default
         center.removeObserver(self)
+
+        // Make sure we restore our hidden dock
+        hiddenDock = nil
     }
 
     // MARK: NSWindowController
@@ -137,6 +148,17 @@ class QuickTerminalController: BaseTerminalController {
 
     // MARK: NSWindowDelegate
 
+    override func windowDidBecomeKey(_ notification: Notification) {
+        super.windowDidBecomeKey(notification)
+
+        // If we're not visible we don't care to run the logic below. It only
+        // applies if we can be seen.
+        guard visible else { return }
+
+        // Re-hide the dock if we were hiding it before.
+        hiddenDock?.hide()
+    }
+
     override func windowDidResignKey(_ notification: Notification) {
         super.windowDidResignKey(notification)
 
@@ -156,6 +178,10 @@ class QuickTerminalController: BaseTerminalController {
         if NSApp.isActive {
             self.previousApp = nil
         }
+
+        // Regardless of autohide, we always want to bring the dock back
+        // when we lose focus.
+        hiddenDock?.restore()
 
         if derivedConfig.quickTerminalAutoHide {
             switch derivedConfig.quickTerminalSpaceBehavior {
@@ -277,25 +303,50 @@ class QuickTerminalController: BaseTerminalController {
         // Move our window off screen to the top
         position.setInitial(in: window, on: screen)
 
+        // We need to set our window level to a high value. In testing, only
+        // popUpMenu and above do what we want. This gets it above the menu bar
+        // and lets us render off screen.
+        window.level = .popUpMenu
+
         // Move it to the visible position since animation requires this
         DispatchQueue.main.async {
             window.makeKeyAndOrderFront(nil)
         }
 
+        // If our dock position would conflict with our target location then
+        // we autohide the dock.
+        if position.conflictsWithDock(on: screen) {
+            if (hiddenDock == nil) {
+                hiddenDock = .init()
+            }
+
+            hiddenDock?.hide()
+        } else {
+            // Ensure we don't have any hidden dock if we don't conflict.
+            // The deinit will restore.
+            hiddenDock = nil
+        }
+
         // Run the animation that moves our window into the proper place and makes
         // it visible.
-        NSAnimationContext.runAnimationGroup(
-            { context in
-                context.duration = derivedConfig.quickTerminalAnimationDuration
-                context.timingFunction = .init(name: .easeIn)
-                position.setFinal(in: window.animator(), on: screen)
-            },
-            completionHandler: {
-                // There is a very minor delay here so waiting at least an event loop tick
-                // keeps us safe from the view not being on the window.
-                DispatchQueue.main.async {
-                    // If we canceled our animation in we do nothing
-                    guard self.visible else { return }
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = derivedConfig.quickTerminalAnimationDuration
+            context.timingFunction = .init(name: .easeIn)
+            position.setFinal(in: window.animator(), on: screen)
+        }, completionHandler: {
+            // There is a very minor delay here so waiting at least an event loop tick
+            // keeps us safe from the view not being on the window.
+            DispatchQueue.main.async {
+                // If we canceled our animation clean up some state.
+                guard self.visible else {
+                    self.hiddenDock = nil
+                    return
+                }
+
+                // After animating in, we reset the window level to a value that
+                // is above other windows but not as high as popUpMenu. This allows
+                // things like IME dropdowns to appear properly.
+                window.level = .floating
 
                     // Now that the window is visible, sync our appearance. This function
                     // requires the window is visible.
@@ -359,6 +410,9 @@ class QuickTerminalController: BaseTerminalController {
     }
 
     private func animateWindowOut(window: NSWindow, to position: QuickTerminalPosition) {
+        // If we hid the dock then we unhide it.
+        hiddenDock = nil
+
         // If the window isn't on our active space then we don't animate, we just
         // hide it.
         if !window.isOnActiveSpace {
@@ -388,17 +442,20 @@ class QuickTerminalController: BaseTerminalController {
             }
         }
 
-        NSAnimationContext.runAnimationGroup(
-            { context in
-                context.duration = derivedConfig.quickTerminalAnimationDuration
-                context.timingFunction = .init(name: .easeIn)
-                position.setInitial(in: window.animator(), on: screen)
-            },
-            completionHandler: {
-                // This causes the window to be removed from the screen list and macOS
-                // handles what should be focused next.
-                window.orderOut(self)
-            })
+        // We need to set our window level to a high value. In testing, only
+        // popUpMenu and above do what we want. This gets it above the menu bar
+        // and lets us render off screen.
+        window.level = .popUpMenu
+
+        NSAnimationContext.runAnimationGroup({ context in
+            context.duration = derivedConfig.quickTerminalAnimationDuration
+            context.timingFunction = .init(name: .easeIn)
+            position.setInitial(in: window.animator(), on: screen)
+        }, completionHandler: {
+            // This causes the window to be removed from the screen list and macOS
+            // handles what should be focused next.
+            window.orderOut(self)
+        })
     }
 
     private func syncAppearance() {
@@ -410,19 +467,6 @@ class QuickTerminalController: BaseTerminalController {
         // If our window is not visible, then no need to sync the appearance yet.
         // Some APIs such as window blur have no effect unless the window is visible.
         guard window.isVisible else { return }
-
-        // Terminals typically operate in sRGB color space and macOS defaults
-        // to "native" which is typically P3. There is a lot more resources
-        // covered in this GitHub issue: https://github.com/mitchellh/ghostty/pull/376
-        // Ghostty defaults to sRGB but this can be overridden.
-        switch self.derivedConfig.windowColorspace {
-        case "display-p3":
-            window.colorSpace = .displayP3
-        case "srgb":
-            fallthrough
-        default:
-            window.colorSpace = .sRGB
-        }
 
         // If we have window transparency then set it transparent. Otherwise set it opaque.
         if self.derivedConfig.backgroundOpacity < 1 {
@@ -462,6 +506,13 @@ class QuickTerminalController: BaseTerminalController {
 
     // MARK: Notifications
 
+    @objc private func applicationWillTerminate(_ notification: Notification) {
+        // If the application is going to terminate we want to make sure we
+        // restore any global dock state. I think deinit should be called which
+        // would call this anyways but I can't be sure so I will do this too.
+        hiddenDock = nil
+    }
+
     @objc private func onToggleFullscreen(notification: SwiftUI.Notification) {
         guard let target = notification.object as? Ghostty.SurfaceView else { return }
         guard target == self.focusedSurface else { return }
@@ -497,7 +548,6 @@ class QuickTerminalController: BaseTerminalController {
         let quickTerminalAnimationDuration: Double
         let quickTerminalAutoHide: Bool
         let quickTerminalSpaceBehavior: QuickTerminalSpaceBehavior
-        let windowColorspace: String
         let backgroundOpacity: Double
 
         init() {
@@ -505,7 +555,6 @@ class QuickTerminalController: BaseTerminalController {
             self.quickTerminalAnimationDuration = 0.2
             self.quickTerminalAutoHide = true
             self.quickTerminalSpaceBehavior = .move
-            self.windowColorspace = ""
             self.backgroundOpacity = 1.0
         }
 
@@ -514,8 +563,36 @@ class QuickTerminalController: BaseTerminalController {
             self.quickTerminalAnimationDuration = config.quickTerminalAnimationDuration
             self.quickTerminalAutoHide = config.quickTerminalAutoHide
             self.quickTerminalSpaceBehavior = config.quickTerminalSpaceBehavior
-            self.windowColorspace = config.windowColorspace
             self.backgroundOpacity = config.backgroundOpacity
+        }
+    }
+
+    /// Hides the dock globally (not just NSApp). This is only used if the quick terminal is
+    /// in a conflicting position with the dock.
+    private class HiddenDock {
+        let previousAutoHide: Bool
+        private var hidden: Bool = false
+
+        init() {
+            previousAutoHide = Dock.autoHideEnabled
+        }
+
+        deinit {
+            restore()
+        }
+
+        func hide() {
+            guard !hidden else { return }
+            NSApp.acquirePresentationOption(.autoHideDock)
+            Dock.autoHideEnabled = true
+            hidden = true
+        }
+
+        func restore() {
+            guard hidden else { return }
+            NSApp.releasePresentationOption(.autoHideDock)
+            Dock.autoHideEnabled = previousAutoHide
+            hidden = false
         }
     }
 }
