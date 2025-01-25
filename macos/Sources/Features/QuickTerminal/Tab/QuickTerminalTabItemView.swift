@@ -3,6 +3,7 @@ import SwiftUI
 struct QuickTerminalTabItemView: View {
     @ObservedObject var tab: QuickTerminalTab
     let isSelected: Bool
+    let isSingleTab: Bool
     let onSelect: () -> Void
     let onClose: () -> Void
 
@@ -13,7 +14,7 @@ struct QuickTerminalTabItemView: View {
             Text(tab.title)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(maxWidth: 150)
+                .frame(minWidth: 0, maxWidth: .infinity)
 
             Button(action: onClose) {
                 Image(systemName: "xmark")
@@ -29,7 +30,7 @@ struct QuickTerminalTabItemView: View {
         .background(
             RoundedRectangle(cornerRadius: 6)
                 .fill(
-                    isSelected
+                    isSelected && !isSingleTab
                         ? Color(NSColor.selectedContentBackgroundColor)
                         : (isHovered ? Color(NSColor.gridColor) : Color.clear))
         )

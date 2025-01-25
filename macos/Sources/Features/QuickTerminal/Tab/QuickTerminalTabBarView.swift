@@ -2,40 +2,32 @@ import SwiftUI
 
 struct QuickTerminalTabBarView: View {
     @ObservedObject var tabManager: QuickTerminalTabManager
-    @GestureState private var isDragging: Bool = false
 
     var body: some View {
         HStack(spacing: 0) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 0) {
-                    ForEach(tabManager.tabs) { tab in
-                        QuickTerminalTabItemView(
-                            tab: tab,
-                            isSelected: tab.isActive,
-                            onSelect: { tabManager.selectTab(tab) },
-                            onClose: { tabManager.closeTab(tab) }
-                        )
-                        .onDrag {
-                            tabManager.draggedTab = tab
-                            return NSItemProvider(object: tab.id.uuidString as NSString)
-                        }
-                        .onDrop(
-                            of: [.text],
-                            delegate: QuickTerminalTabDropDelegate(
-                                item: tab,
-                                tabManager: tabManager,
-                                currentTab: tabManager.draggedTab
-                            )
-                        )
+            HStack(spacing: 0) {
+                ForEach(tabManager.tabs) { tab in
+                    QuickTerminalTabItemView(
+                        tab: tab,
+                        isSelected: tab.isActive,
+                        isSingleTab: tabManager.tabs.count == 1,
+                        onSelect: { tabManager.selectTab(tab) },
+                        onClose: { tabManager.closeTab(tab) }
+                    )
+                    .onDrag {
+                        tabManager.draggedTab = tab
+                        return NSItemProvider(object: tab.id.uuidString as NSString)
                     }
+                    .onDrop(
+                        of: [.text],
+                        delegate: QuickTerminalTabDropDelegate(
+                            item: tab,
+                            tabManager: tabManager,
+                            currentTab: tabManager.draggedTab
+                        )
+                    )
                 }
             }
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .updating($isDragging) { _, state, _ in
-                        state = true
-                    }
-            )
 
             Divider()
 
@@ -43,7 +35,7 @@ struct QuickTerminalTabBarView: View {
                 .foregroundColor(.gray)
                 .padding(.horizontal, 8)
                 .frame(width: 50)
-                .contentShape(Rectangle())  // Make the entire frame clickable
+                .contentShape(Rectangle())
                 .onTapGesture {
                     tabManager.newTab()
                 }
