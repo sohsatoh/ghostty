@@ -14,6 +14,18 @@ struct QuickTerminalTabBarView: View {
                         onSelect: { tabManager.selectTab(tab) },
                         onClose: { tabManager.closeTab(tab) }
                     )
+                    .contextMenu {
+                        Button("Close Tab") {
+                            tabManager.closeTab(tab)
+                        }
+                        Button("Close Other Tabs") {
+                            tabManager.tabs.forEach { otherTab in
+                                if otherTab.id != tab.id {
+                                    tabManager.closeTab(otherTab)
+                                }
+                            }
+                        }
+                    }
                     .onDrag {
                         tabManager.draggedTab = tab
                         return NSItemProvider(object: tab.id.uuidString as NSString)
