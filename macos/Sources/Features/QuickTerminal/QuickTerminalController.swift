@@ -58,8 +58,11 @@ class QuickTerminalController: BaseTerminalController {
             selector: #selector(ghosttyConfigDidChange(_:)),
             name: .ghosttyConfigDidChange,
             object: nil)
-
-        // Setup our notifications for tab behaviors
+        center.addObserver(
+            self,
+            selector: #selector(onNewTab(_:)),
+            name: Ghostty.Notification.ghosttyNewTab,
+            object: nil)
         center.addObserver(
             tabManager,
             selector: #selector(tabManager.onMoveTab(_:)),
@@ -452,11 +455,6 @@ class QuickTerminalController: BaseTerminalController {
     }
 
     // MARK: First Responder
-
-    @IBAction func newTab(_ sender: Any?) {
-        tabManager.addNewTab()
-    }
-
     @IBAction func toggleGhosttyFullScreen(_ sender: Any) {
         guard let surface = focusedSurface?.surface else { return }
         ghostty.toggleFullscreen(surface: surface)
@@ -488,6 +486,10 @@ class QuickTerminalController: BaseTerminalController {
         self.derivedConfig = DerivedConfig(config)
 
         syncAppearance()
+    }
+
+    @objc func onNewTab(_ sender: Any?) {
+        tabManager.newTab()
     }
 
     private struct DerivedConfig {

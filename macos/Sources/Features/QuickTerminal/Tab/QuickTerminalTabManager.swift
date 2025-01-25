@@ -11,7 +11,7 @@ class QuickTerminalTabManager: ObservableObject {
         self.controller = controller
     }
 
-    func addNewTab() {
+    func newTab() {
         guard let ghostty = controller?.ghostty else { return }
 
         let leaf: Ghostty.SplitNode.Leaf = .init(ghostty.app!, baseConfig: nil)
@@ -40,7 +40,7 @@ class QuickTerminalTabManager: ObservableObject {
 
             if currentTab?.id == tab.id {
                 if tabs.isEmpty {
-                    addNewTab()
+                    newTab()
                 } else {
                     let newIndex = min(index, tabs.count - 1)
                     selectTab(tabs[newIndex])

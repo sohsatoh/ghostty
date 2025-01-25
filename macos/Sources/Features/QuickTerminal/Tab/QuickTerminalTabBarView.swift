@@ -45,7 +45,7 @@ struct TabBarView: View {
                 .frame(width: 50)
                 .contentShape(Rectangle())  // Make the entire frame clickable
                 .onTapGesture {
-                    tabManager.addNewTab()
+                    tabManager.newTab()
                 }
                 .buttonStyle(PlainButtonStyle())
                 .help("New Tab")
