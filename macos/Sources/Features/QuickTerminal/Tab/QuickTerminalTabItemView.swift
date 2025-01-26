@@ -11,19 +11,20 @@ struct QuickTerminalTabItemView: View {
 
     var body: some View {
         HStack(spacing: 4) {
-            Text(tab.title)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(minWidth: 0, maxWidth: .infinity)
-
             Button(action: onClose) {
                 Image(systemName: "xmark")
                     .font(.system(size: 11))
                     .foregroundColor(isHovered ? .primary : .secondary)
             }
             .buttonStyle(PlainButtonStyle())
-            .opacity(isHovered || isSelected ? 1 : 0)
-            .animation(.easeInOut, value: isHovered || isSelected)
+            .opacity(isHovered ? 1 : 0)
+            .animation(.easeInOut, value: isHovered)
+
+            Text(tab.title)
+                .foregroundColor(isSelected ? .primary : .secondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(minWidth: 0, maxWidth: .infinity)
         }
         .padding(.horizontal, 8)
         .frame(height: 32)
