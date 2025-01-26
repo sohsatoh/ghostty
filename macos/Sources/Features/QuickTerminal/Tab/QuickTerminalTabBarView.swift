@@ -9,8 +9,7 @@ struct QuickTerminalTabBarView: View {
                 ForEach(tabManager.tabs) { tab in
                     QuickTerminalTabItemView(
                         tab: tab,
-                        isSelected: tab.isActive,
-                        isSingleTab: tabManager.tabs.count == 1,
+                        isHighlighted: tab.isActive,
                         onSelect: { tabManager.selectTab(tab) },
                         onClose: { tabManager.closeTab(tab) }
                     )

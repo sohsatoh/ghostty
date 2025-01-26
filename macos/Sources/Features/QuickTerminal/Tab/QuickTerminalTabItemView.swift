@@ -2,8 +2,7 @@ import SwiftUI
 
 struct QuickTerminalTabItemView: View {
     @ObservedObject var tab: QuickTerminalTab
-    let isSelected: Bool
-    let isSingleTab: Bool
+    let isHighlighted: Bool
     let onSelect: () -> Void
     let onClose: () -> Void
 
@@ -21,7 +20,7 @@ struct QuickTerminalTabItemView: View {
             .animation(.easeInOut, value: isHovered)
 
             Text(tab.title)
-                .foregroundColor(isSelected ? .primary : .secondary)
+                .foregroundColor(isHighlighted ? .primary : .secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
                 .frame(minWidth: 0, maxWidth: .infinity)
@@ -31,7 +30,7 @@ struct QuickTerminalTabItemView: View {
         .background(
             Rectangle()
                 .fill(
-                    isSelected && !isSingleTab
+                    isHighlighted
                         ? Color(NSColor.controlBackgroundColor)
                         : (isHovered ? Color(NSColor.underPageBackgroundColor) : Color(NSColor.windowBackgroundColor)))
         )
