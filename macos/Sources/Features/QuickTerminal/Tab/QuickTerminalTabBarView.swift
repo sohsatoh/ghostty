@@ -38,11 +38,10 @@ struct QuickTerminalTabBarView: View {
                             currentTab: tabManager.draggedTab
                         )
                     )
+                    Divider()
+                        .background(Color(NSColor.separatorColor))
                 }
             }
-
-            Divider()
-                .background(Color(NSColor.separatorColor))
 
             Image(systemName: "plus")
                 .foregroundColor(Color(NSColor.secondaryLabelColor))
