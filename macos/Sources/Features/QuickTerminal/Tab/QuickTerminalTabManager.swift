@@ -41,6 +41,7 @@ class QuickTerminalTabManager: ObservableObject {
             if currentTab?.id == tab.id {
                 if tabs.isEmpty {
                     newTab()
+                    controller?.animateOut()
                 } else {
                     let newIndex = min(index, tabs.count - 1)
                     selectTab(tabs[newIndex])
