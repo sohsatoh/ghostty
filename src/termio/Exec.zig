@@ -5,11 +5,12 @@ const Exec = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const posix = std.posix;
-const xev = @import("xev");
+const xev = @import("../global.zig").xev;
+const apprt = @import("../apprt.zig");
 const build_config = @import("../build_config.zig");
 const configpkg = @import("../config.zig");
 const crash = @import("../crash/main.zig");
@@ -24,12 +25,19 @@ const SegmentedPool = @import("../datastruct/main.zig").SegmentedPool;
 const ptypkg = @import("../pty.zig");
 const Pty = ptypkg.Pty;
 const EnvMap = std.process.EnvMap;
+const PasswdEntry = internal_os.passwd.Entry;
 const windows = internal_os.windows;
 
 const log = std.log.scoped(.io_exec);
 
 /// The termios poll rate in milliseconds.
 const TERMIOS_POLL_MS = 200;
+
+/// If we build with flatpak support then we have to keep track of
+/// a potential execution on the host.
+const FlatpakHostCommand = if (!build_config.flatpak) struct {
+    pub const Completion = struct {};
+} else internal_os.FlatpakHostCommand;
 
 /// The subprocess state for our exec backend.
 subprocess: Subprocess,
@@ -82,24 +90,30 @@ pub fn threadEnter(
     // Start our subprocess
     const pty_fds = self.subprocess.start(alloc) catch |err| {
         // If we specifically got this error then we are in the forked
-        // process and our child failed to execute. In that case
-        if (err != error.Termio) return err;
+        // process and our child failed to execute. If we DIDN'T
+        // get this specific error then we're in the parent and
+        // we need to bubble it up.
+        if (err != error.ExecFailedInChild) return err;
 
-        // Output an error message about the exec faililng and exit.
-        // This generally should NOT happen because we always wrap
-        // our command execution either in login (macOS) or /bin/sh
-        // (Linux) which are usually guaranteed to exist. Still, we
-        // want to handle this scenario.
-        execFailedInChild() catch {};
+        // We're in the child. Nothing more we can do but abnormal exit.
+        // The Command will output some additional information.
         posix.exit(1);
     };
     errdefer self.subprocess.stop();
 
-    // Get the pid from the subprocess
-    const pid = pid: {
-        const command = self.subprocess.command orelse return error.ProcessNotStarted;
-        break :pid command.pid orelse return error.ProcessNoPid;
-    };
+    // Watcher to detect subprocess exit
+    var process: ?xev.Process = if (self.subprocess.process) |v| switch (v) {
+        .fork_exec => |cmd| try xev.Process.init(
+            cmd.pid orelse return error.ProcessNoPid,
+        ),
+
+        // If we're executing via Flatpak then we can't do
+        // traditional process watching (its implemented
+        // as a special case in os/flatpak.zig) since the
+        // command is on the host.
+        .flatpak => null,
+    } else return error.ProcessNotStarted;
+    errdefer if (process) |*p| p.deinit();
 
     // Track our process start time for abnormal exits
     const process_start = try std.time.Instant.now();
@@ -113,10 +127,6 @@ pub fn threadEnter(
     // Setup our stream so that we can write.
     var stream = xev.Stream.initFd(pty_fds.write);
     errdefer stream.deinit();
-
-    // Watcher to detect subprocess exit
-    var process = try xev.Process.init(pid);
-    errdefer process.deinit();
 
     // Start our timer to read termios state changes. This is used
     // to detect things such as when password input is being done
@@ -135,8 +145,6 @@ pub fn threadEnter(
     // Setup our threadata backend state to be our own
     td.backend = .{ .exec = .{
         .start = process_start,
-        .abnormal_runtime_threshold_ms = io.config.abnormal_runtime_threshold_ms,
-        .wait_after_command = io.config.wait_after_command,
         .write_stream = stream,
         .process = process,
         .read_thread = read_thread,
@@ -145,14 +153,28 @@ pub fn threadEnter(
         .termios_timer = termios_timer,
     } };
 
-    // Start our process watcher
-    process.wait(
+    // Start our process watcher. If we have an xev.Process use it.
+    if (process) |*p| p.wait(
         td.loop,
         &td.backend.exec.process_wait_c,
         termio.Termio.ThreadData,
         td,
         processExit,
-    );
+    ) else if (comptime build_config.flatpak) flatpak: {
+        switch (self.subprocess.process orelse break :flatpak) {
+            // If we're in flatpak and we have a flatpak command
+            // then we can run the special flatpak logic for watching.
+            .flatpak => |*c| c.waitXev(
+                td.loop,
+                &td.backend.exec.flatpak_wait_c,
+                termio.Termio.ThreadData,
+                td,
+                flatpakExit,
+            ),
+
+            .fork_exec => {},
+        }
+    }
 
     // Start our termios timer. We don't support this on Windows.
     // Fundamentally, we could support this on Windows so we're just
@@ -243,111 +265,7 @@ pub fn resize(
     return try self.subprocess.resize(grid_size, screen_size);
 }
 
-/// Called when the child process exited abnormally but before the surface
-/// is notified.
-pub fn childExitedAbnormally(
-    self: *Exec,
-    gpa: Allocator,
-    t: *terminal.Terminal,
-    exit_code: u32,
-    runtime_ms: u64,
-) !void {
-    var arena = ArenaAllocator.init(gpa);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    // Build up our command for the error message
-    const command = try std.mem.join(alloc, " ", self.subprocess.args);
-    const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{runtime_ms});
-
-    // No matter what move the cursor back to the column 0.
-    t.carriageReturn();
-
-    // Reset styles
-    try t.setAttribute(.{ .unset = {} });
-
-    // If there is data in the viewport, we want to scroll down
-    // a little bit and write a horizontal rule before writing
-    // our message. This lets the use see the error message the
-    // command may have output.
-    const viewport_str = try t.plainString(alloc);
-    if (viewport_str.len > 0) {
-        try t.linefeed();
-        for (0..t.cols) |_| try t.print(0x2501);
-        t.carriageReturn();
-        try t.linefeed();
-        try t.linefeed();
-    }
-
-    // Output our error message
-    try t.setAttribute(.{ .@"8_fg" = .bright_red });
-    try t.setAttribute(.{ .bold = {} });
-    try t.printString("Ghostty failed to launch the requested command:");
-    try t.setAttribute(.{ .unset = {} });
-
-    t.carriageReturn();
-    try t.linefeed();
-    try t.linefeed();
-    try t.printString(command);
-    try t.setAttribute(.{ .unset = {} });
-
-    t.carriageReturn();
-    try t.linefeed();
-    try t.linefeed();
-    try t.printString("Runtime: ");
-    try t.setAttribute(.{ .@"8_fg" = .red });
-    try t.printString(runtime_str);
-    try t.setAttribute(.{ .unset = {} });
-
-    // We don't print this on macOS because the exit code is always 0
-    // due to the way we launch the process.
-    if (comptime !builtin.target.isDarwin()) {
-        const exit_code_str = try std.fmt.allocPrint(alloc, "{d}", .{exit_code});
-        t.carriageReturn();
-        try t.linefeed();
-        try t.printString("Exit Code: ");
-        try t.setAttribute(.{ .@"8_fg" = .red });
-        try t.printString(exit_code_str);
-        try t.setAttribute(.{ .unset = {} });
-    }
-
-    t.carriageReturn();
-    try t.linefeed();
-    try t.linefeed();
-    try t.printString("Press any key to close the window.");
-
-    // Hide the cursor
-    t.modes.set(.cursor_visible, false);
-}
-
-/// This outputs an error message when exec failed and we are the
-/// child process. This returns so the caller should probably exit
-/// after calling this.
-///
-/// Note that this usually is only called under very very rare
-/// circumstances because we wrap our command execution in login
-/// (macOS) or /bin/sh (Linux). So this output can be pretty crude
-/// because it should never happen. Notably, this is not the error
-/// users see when `command` is invalid.
-fn execFailedInChild() !void {
-    const stderr = std.io.getStdErr().writer();
-    try stderr.writeAll("exec failed\n");
-    try stderr.writeAll("press any key to exit\n");
-
-    var buf: [1]u8 = undefined;
-    var reader = std.io.getStdIn().reader();
-    _ = try reader.read(&buf);
-}
-
-fn processExit(
-    td_: ?*termio.Termio.ThreadData,
-    _: *xev.Loop,
-    _: *xev.Completion,
-    r: xev.Process.WaitError!u32,
-) xev.CallbackAction {
-    const exit_code = r catch unreachable;
-
-    const td = td_.?;
+fn processExitCommon(td: *termio.Termio.ThreadData, exit_code: u32) void {
     assert(td.backend == .exec);
     const execdata = &td.backend.exec;
     execdata.exited = true;
@@ -364,64 +282,35 @@ fn processExit(
         .{ exit_code, runtime_ms orelse 0 },
     );
 
-    // If our runtime was below some threshold then we assume that this
-    // was an abnormal exit and we show an error message.
-    if (runtime_ms) |runtime| runtime: {
-        // On macOS, our exit code detection doesn't work, possibly
-        // because of our `login` wrapper. More investigation required.
-        if (comptime !builtin.target.isDarwin()) {
-            // If our exit code is zero, then the command was successful
-            // and we don't ever consider it abnormal.
-            if (exit_code == 0) break :runtime;
-        }
-
-        // Our runtime always has to be under the threshold to be
-        // considered abnormal. This is because a user can always
-        // manually do something like `exit 1` in their shell to
-        // force the exit code to be non-zero. We only want to detect
-        // abnormal exits that happen so quickly the user can't react.
-        if (runtime > execdata.abnormal_runtime_threshold_ms) break :runtime;
-        log.warn("abnormal process exit detected, showing error message", .{});
-
-        // Notify our main writer thread which has access to more
-        // information so it can show a better error message.
-        td.mailbox.send(.{
-            .child_exited_abnormally = .{
-                .exit_code = exit_code,
-                .runtime_ms = runtime,
-            },
-        }, null);
-        td.mailbox.notify();
-
-        return .disarm;
-    }
-
-    // If we're purposely waiting then we just return since the process
-    // exited flag is set to true. This allows the terminal window to remain
-    // open.
-    if (execdata.wait_after_command) {
-        // We output a message so that the user knows whats going on and
-        // doesn't think their terminal just froze.
-        terminal: {
-            td.renderer_state.mutex.lock();
-            defer td.renderer_state.mutex.unlock();
-            const t = td.renderer_state.terminal;
-            t.carriageReturn();
-            t.linefeed() catch break :terminal;
-            t.printString("Process exited. Press any key to close the terminal.") catch
-                break :terminal;
-            t.modes.set(.cursor_visible, false);
-        }
-
-        return .disarm;
-    }
-
-    // Notify our surface we want to close
+    // We always notify the surface immediately that the child has
+    // exited and some metadata about the exit.
     _ = td.surface_mailbox.push(.{
-        .child_exited = {},
+        .child_exited = .{
+            .exit_code = exit_code,
+            .runtime_ms = runtime_ms orelse 0,
+        },
     }, .{ .forever = {} });
+}
 
+fn processExit(
+    td_: ?*termio.Termio.ThreadData,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Process.WaitError!u32,
+) xev.CallbackAction {
+    const exit_code = r catch unreachable;
+    processExitCommon(td_.?, exit_code);
     return .disarm;
+}
+
+fn flatpakExit(
+    td_: ?*termio.Termio.ThreadData,
+    _: *xev.Loop,
+    _: *FlatpakHostCommand.Completion,
+    r: FlatpakHostCommand.WaitError!u8,
+) void {
+    const exit_code = r catch unreachable;
+    processExitCommon(td_.?, exit_code);
 }
 
 fn termiosTimer(
@@ -520,14 +409,8 @@ pub fn queueWrite(
     _ = self;
     const exec = &td.backend.exec;
 
-    // If our process is exited then we send our surface a message
-    // about it but we don't queue any more writes.
-    if (exec.exited) {
-        _ = td.surface_mailbox.push(.{
-            .child_exited = {},
-        }, .{ .forever = {} });
-        return;
-    }
+    // If our process is exited then we don't send any more writes.
+    if (exec.exited) return;
 
     // We go through and chunk the data if necessary to fit into
     // our cached buffers that we can queue to the stream.
@@ -589,7 +472,7 @@ fn ttyWrite(
     _: *xev.Completion,
     _: xev.Stream,
     _: xev.WriteBuffer,
-    r: xev.Stream.WriteError!usize,
+    r: xev.WriteError!usize,
 ) xev.CallbackAction {
     const td = td_.?;
     td.write_req_pool.put();
@@ -615,36 +498,29 @@ pub const ThreadData = struct {
     start: std.time.Instant,
     exited: bool = false,
 
-    /// The number of milliseconds below which we consider a process
-    /// exit to be abnormal. This is used to show an error message
-    /// when the process exits too quickly.
-    abnormal_runtime_threshold_ms: u32,
-
-    /// If true, do not immediately send a child exited message to the
-    /// surface to close the surface when the command exits. If this is
-    /// false we'll show a process exited message and wait for user input
-    /// to close the surface.
-    wait_after_command: bool,
-
     /// The data stream is the main IO for the pty.
     write_stream: xev.Stream,
 
     /// The process watcher
-    process: xev.Process,
+    process: ?xev.Process,
 
     /// This is the pool of available (unused) write requests. If you grab
     /// one from the pool, you must put it back when you're done!
-    write_req_pool: SegmentedPool(xev.Stream.WriteRequest, WRITE_REQ_PREALLOC) = .{},
+    write_req_pool: SegmentedPool(xev.WriteRequest, WRITE_REQ_PREALLOC) = .{},
 
     /// The pool of available buffers for writing to the pty.
     write_buf_pool: SegmentedPool([64]u8, WRITE_REQ_PREALLOC) = .{},
 
     /// The write queue for the data stream.
-    write_queue: xev.Stream.WriteQueue = .{},
+    write_queue: xev.WriteQueue = .{},
 
     /// This is used for both waiting for the process to exit and then
     /// subsequently to wait for the data_stream to close.
     process_wait_c: xev.Completion = .{},
+
+    // The completion specific to Flatpak process waiting. If
+    // we aren't compiling with Flatpak support this is zero-sized.
+    flatpak_wait_c: FlatpakHostCommand.Completion = .{},
 
     /// Reader thread state
     read_thread: std.Thread,
@@ -670,7 +546,7 @@ pub const ThreadData = struct {
         self.write_buf_pool.deinit(alloc);
 
         // Stop our process watcher
-        self.process.deinit();
+        if (self.process) |*p| p.deinit();
 
         // Stop our write stream
         self.write_stream.deinit();
@@ -681,7 +557,9 @@ pub const ThreadData = struct {
 };
 
 pub const Config = struct {
-    command: ?[]const u8 = null,
+    command: ?configpkg.Command = null,
+    env: EnvMap,
+    env_override: configpkg.RepeatableStringMap = .{},
     shell_integration: configpkg.Config.ShellIntegration = .detect,
     shell_integration_features: configpkg.Config.ShellIntegrationFeatures = .{},
     working_directory: ?[]const u8 = null,
@@ -691,10 +569,6 @@ pub const Config = struct {
 };
 
 const Subprocess = struct {
-    /// If we build with flatpak support then we have to keep track of
-    /// a potential execution on the host.
-    const FlatpakHostCommand = if (build_config.flatpak) internal_os.FlatpakHostCommand else void;
-
     const c = @cImport({
         @cInclude("errno.h");
         @cInclude("signal.h");
@@ -702,15 +576,34 @@ const Subprocess = struct {
     });
 
     arena: std.heap.ArenaAllocator,
-    cwd: ?[]const u8,
-    env: EnvMap,
-    args: [][]const u8,
+    cwd: ?[:0]const u8,
+    env: ?EnvMap,
+    args: []const [:0]const u8,
     grid_size: renderer.GridSize,
     screen_size: renderer.ScreenSize,
     pty: ?Pty = null,
-    command: ?Command = null,
-    flatpak_command: ?FlatpakHostCommand = null,
+    process: ?Process = null,
     linux_cgroup: Command.LinuxCgroup = Command.linux_cgroup_default,
+
+    /// Union that represents the running process type.
+    const Process = union(enum) {
+        /// Standard POSIX fork/exec
+        fork_exec: Command,
+
+        /// Flatpak DBus command
+        flatpak: FlatpakHostCommand,
+    };
+
+    const ArgsFormatter = struct {
+        args: []const [:0]const u8,
+
+        pub fn format(this: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            for (this.args, 0..) |a, i| {
+                if (i > 0) try writer.writeAll(", ");
+                try writer.print("`{s}`", .{a});
+            }
+        }
+    };
 
     /// Initialize the subprocess. This will NOT start it, this only sets
     /// up the internal state necessary to start it later.
@@ -721,19 +614,9 @@ const Subprocess = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
 
-        // Set our env vars. For Flatpak builds running in Flatpak we don't
-        // inherit our environment because the login shell on the host side
-        // will get it.
-        var env = env: {
-            if (comptime build_config.flatpak) {
-                if (internal_os.isFlatpak()) {
-                    break :env std.process.EnvMap.init(alloc);
-                }
-            }
-
-            break :env try std.process.getEnvMap(alloc);
-        };
-        errdefer env.deinit();
+        // Get our env. If a default env isn't provided by the caller
+        // then we get it ourselves.
+        var env = cfg.env;
 
         // If we have a resources dir then set our env var
         if (cfg.resources_dir) |dir| {
@@ -759,7 +642,7 @@ const Subprocess = struct {
             });
             try env.put("TERMINFO", dir);
         } else {
-            if (comptime builtin.target.isDarwin()) {
+            if (comptime builtin.target.os.tag.isDarwin()) {
                 log.warn("ghostty terminfo not found, using xterm-256color", .{});
                 log.warn("the terminfo SHOULD exist on macos, please ensure", .{});
                 log.warn("you're using a valid app bundle.", .{});
@@ -771,6 +654,13 @@ const Subprocess = struct {
 
         // Add our binary to the path if we can find it.
         ghostty_path: {
+            // Skip this for flatpak since host cannot reach them
+            if ((comptime build_config.flatpak) and
+                internal_os.isFlatpak())
+            {
+                break :ghostty_path;
+            }
+
             var exe_buf: [std.fs.max_path_bytes]u8 = undefined;
             const exe_bin_path = std.fs.selfExePath(&exe_buf) catch |err| {
                 log.warn("failed to get ghostty exe path err={}", .{err});
@@ -805,7 +695,7 @@ const Subprocess = struct {
 
         // On macOS, export additional data directories from our
         // application bundle.
-        if (comptime builtin.target.isDarwin()) darwin: {
+        if (comptime builtin.target.os.tag.isDarwin()) darwin: {
             const resources_dir = cfg.resources_dir orelse break :darwin;
 
             var buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -847,48 +737,35 @@ const Subprocess = struct {
         try env.put("TERM_PROGRAM", "ghostty");
         try env.put("TERM_PROGRAM_VERSION", build_config.version_string);
 
-        // When embedding in macOS and running via XCode, XCode injects
-        // a bunch of things that break our shell process. We remove those.
-        if (comptime builtin.target.isDarwin() and build_config.artifact == .lib) {
-            if (env.get("__XCODE_BUILT_PRODUCTS_DIR_PATHS") != null) {
-                env.remove("__XCODE_BUILT_PRODUCTS_DIR_PATHS");
-                env.remove("__XPC_DYLD_LIBRARY_PATH");
-                env.remove("DYLD_FRAMEWORK_PATH");
-                env.remove("DYLD_INSERT_LIBRARIES");
-                env.remove("DYLD_LIBRARY_PATH");
-                env.remove("LD_LIBRARY_PATH");
-                env.remove("SECURITYSESSIONID");
-                env.remove("XPC_SERVICE_NAME");
-            }
-
-            // Remove this so that running `ghostty` within Ghostty works.
-            env.remove("GHOSTTY_MAC_APP");
-        }
-
         // VTE_VERSION is set by gnome-terminal and other VTE-based terminals.
         // We don't want our child processes to think we're running under VTE.
+        // This is not apprt-specific, so we do it here.
         env.remove("VTE_VERSION");
 
-        // Don't leak these GTK environment variables to child processes.
-        if (comptime build_config.app_runtime == .gtk) {
-            env.remove("GDK_DEBUG");
-            env.remove("GDK_DISABLE");
-            env.remove("GSK_RENDERER");
-        }
-
         // Setup our shell integration, if we can.
-        const integrated_shell: ?shell_integration.Shell, const shell_command: []const u8 = shell: {
-            const default_shell_command = cfg.command orelse switch (builtin.os.tag) {
-                .windows => "cmd.exe",
-                else => "sh",
-            };
+        const shell_command: configpkg.Command = shell: {
+            const default_shell_command: configpkg.Command =
+                cfg.command orelse .{ .shell = switch (builtin.os.tag) {
+                    .windows => "cmd.exe",
+                    else => "sh",
+                } };
+
+            // Always set up shell features (GHOSTTY_SHELL_FEATURES). These are
+            // used by both automatic and manual shell integrations.
+            try shell_integration.setupFeatures(
+                &env,
+                cfg.shell_integration_features,
+            );
 
             const force: ?shell_integration.Shell = switch (cfg.shell_integration) {
                 .none => {
-                    // Even if shell integration is none, we still want to set up the feature env vars
-                    try shell_integration.setupFeatures(&env, cfg.shell_integration_features);
-                    break :shell .{ null, default_shell_command };
+                    // This is a source of confusion for users despite being
+                    // opt-in since it results in some Ghostty features not
+                    // working. We always want to log it.
+                    log.info("shell integration disabled by configuration", .{});
+                    break :shell default_shell_command;
                 },
+
                 .detect => null,
                 .bash => .bash,
                 .elvish => .elvish,
@@ -896,9 +773,9 @@ const Subprocess = struct {
                 .zsh => .zsh,
             };
 
-            const dir = cfg.resources_dir orelse break :shell .{
-                null,
-                default_shell_command,
+            const dir = cfg.resources_dir orelse {
+                log.warn("no resources dir set, shell integration disabled", .{});
+                break :shell default_shell_command;
             };
 
             const integration = try shell_integration.setup(
@@ -907,158 +784,69 @@ const Subprocess = struct {
                 default_shell_command,
                 &env,
                 force,
-                cfg.shell_integration_features,
-            ) orelse break :shell .{ null, default_shell_command };
+            ) orelse {
+                log.warn("shell could not be detected, no automatic shell integration will be injected", .{});
+                break :shell default_shell_command;
+            };
 
-            break :shell .{ integration.shell, integration.command };
-        };
-
-        if (integrated_shell) |shell| {
             log.info(
                 "shell integration automatically injected shell={}",
-                .{shell},
+                .{integration.shell},
             );
-        } else if (cfg.shell_integration != .none) {
-            log.warn("shell could not be detected, no automatic shell integration will be injected", .{});
+
+            break :shell integration.command;
+        };
+
+        // Add the environment variables that override any others.
+        {
+            var it = cfg.env_override.iterator();
+            while (it.next()) |entry| try env.put(
+                entry.key_ptr.*,
+                entry.value_ptr.*,
+            );
         }
 
         // Build our args list
-        const args = args: {
-            const cap = 9; // the most we'll ever use
-            var args = try std.ArrayList([]const u8).initCapacity(alloc, cap);
-            defer args.deinit();
+        const args: []const [:0]const u8 = execCommand(
+            alloc,
+            shell_command,
+            internal_os.passwd,
+        ) catch |err| switch (err) {
+            // If we fail to allocate space for the command we want to
+            // execute, we'd still like to try to run something so
+            // Ghostty can launch (and maybe the user can debug this further).
+            // Realistically, if you're getting OOM, I think other stuff is
+            // about to crash, but we can try.
+            error.OutOfMemory => oom: {
+                log.warn("failed to allocate space for command args, falling back to basic shell", .{});
 
-            // If we're on macOS, we have to use `login(1)` to get all of
-            // the proper environment variables set, a login shell, and proper
-            // hushlogin behavior.
-            if (comptime builtin.target.isDarwin()) darwin: {
-                const passwd = internal_os.passwd.get(alloc) catch |err| {
-                    log.warn("failed to read passwd, not using a login shell err={}", .{err});
-                    break :darwin;
+                // The comptime here is important to ensure the full slice
+                // is put into the binary data and not the stack.
+                break :oom comptime switch (builtin.os.tag) {
+                    .windows => &.{"cmd.exe"},
+                    else => &.{"/bin/sh"},
                 };
+            },
 
-                const username = passwd.name orelse {
-                    log.warn("failed to get username, not using a login shell", .{});
-                    break :darwin;
-                };
-
-                const hush = if (passwd.home) |home| hush: {
-                    var dir = std.fs.openDirAbsolute(home, .{}) catch |err| {
-                        log.warn(
-                            "failed to open home dir, not checking for hushlogin err={}",
-                            .{err},
-                        );
-                        break :hush false;
-                    };
-                    defer dir.close();
-
-                    break :hush if (dir.access(".hushlogin", .{})) true else |_| false;
-                } else false;
-
-                const cmd = try std.fmt.allocPrint(
-                    alloc,
-                    "exec -l {s}",
-                    .{shell_command},
-                );
-
-                // The reason for executing login this way is unclear. This
-                // comment will attempt to explain but prepare for a truly
-                // unhinged reality.
-                //
-                // The first major issue is that on macOS, a lot of users
-                // put shell configurations in ~/.bash_profile instead of
-                // ~/.bashrc (or equivalent for another shell). This file is only
-                // loaded for a login shell so macOS users expect all their terminals
-                // to be login shells. No other platform behaves this way and its
-                // totally braindead but somehow the entire dev community on
-                // macOS has cargo culted their way to this reality so we have to
-                // do it...
-                //
-                // To get a login shell, you COULD just prepend argv0 with a `-`
-                // but that doesn't fully work because `getlogin()` C API will
-                // return the wrong value, SHELL won't be set, and various
-                // other login behaviors that macOS users expect.
-                //
-                // The proper way is to use `login(1)`. But login(1) forces
-                // the working directory to change to the home directory,
-                // which we may not want. If we specify "-l" then we can avoid
-                // this behavior but now the shell isn't a login shell.
-                //
-                // There is another issue: `login(1)` on macOS 14.3 and earlier
-                // checked for ".hushlogin" in the working directory. This means
-                // that if we specify "-l" then we won't get hushlogin honored
-                // if its in the home directory (which is standard). To get
-                // around this, we check for hushlogin ourselves and if present
-                // specify the "-q" flag to login(1).
-                //
-                // So to get all the behaviors we want, we specify "-l" but
-                // execute "bash" (which is built-in to macOS). We then use
-                // the bash builtin "exec" to replace the process with a login
-                // shell ("-l" on exec) with the command we really want.
-                //
-                // We use "bash" instead of other shells that ship with macOS
-                // because as of macOS Sonoma, we found with a microbenchmark
-                // that bash can `exec` into the desired command ~2x faster
-                // than zsh.
-                //
-                // To figure out a lot of this logic I read the login.c
-                // source code in the OSS distribution Apple provides for
-                // macOS.
-                //
-                // Awesome.
-                try args.append("/usr/bin/login");
-                if (hush) try args.append("-q");
-                try args.append("-flp");
-
-                // We execute bash with "--noprofile --norc" so that it doesn't
-                // load startup files so that (1) our shell integration doesn't
-                // break and (2) user configuration doesn't mess this process
-                // up.
-                try args.append(username);
-                try args.append("/bin/bash");
-                try args.append("--noprofile");
-                try args.append("--norc");
-                try args.append("-c");
-                try args.append(cmd);
-                break :args try args.toOwnedSlice();
-            }
-
-            if (comptime builtin.os.tag == .windows) {
-                // We run our shell wrapped in `cmd.exe` so that we don't have
-                // to parse the command line ourselves if it has arguments.
-
-                // Note we don't free any of the memory below since it is
-                // allocated in the arena.
-                const windir = try std.process.getEnvVarOwned(alloc, "WINDIR");
-                const cmd = try std.fs.path.join(alloc, &[_][]const u8{
-                    windir,
-                    "System32",
-                    "cmd.exe",
-                });
-
-                try args.append(cmd);
-                try args.append("/C");
-            } else {
-                // We run our shell wrapped in `/bin/sh` so that we don't have
-                // to parse the command line ourselves if it has arguments.
-                // Additionally, some environments (NixOS, I found) use /bin/sh
-                // to setup some environment variables that are important to
-                // have set.
-                try args.append("/bin/sh");
-                if (internal_os.isFlatpak()) try args.append("-l");
-                try args.append("-c");
-            }
-
-            try args.append(shell_command);
-            break :args try args.toOwnedSlice();
+            // This logs on its own, this is a bad error.
+            error.SystemError => return err,
         };
 
         // We have to copy the cwd because there is no guarantee that
         // pointers in full_config remain valid.
-        const cwd: ?[]u8 = if (cfg.working_directory) |cwd|
-            try alloc.dupe(u8, cwd)
+        const cwd: ?[:0]u8 = if (cfg.working_directory) |cwd|
+            try alloc.dupeZ(u8, cwd)
         else
             null;
+
+        // Propagate the current working directory (CWD) to the shell, enabling
+        // the shell to display the current directory name rather than the
+        // resolved path for symbolic links. This is important and based
+        // on the same behavior in Konsole and Kitty (see the linked issues):
+        // https://bugs.kde.org/show_bug.cgi?id=242114
+        // https://github.com/kovidgoyal/kitty/issues/1595
+        // https://github.com/ghostty-org/ghostty/discussions/7769
+        if (cwd) |pwd| try env.put("PWD", pwd);
 
         // If we have a cgroup, then we copy that into our arena so the
         // memory remains valid when we start.
@@ -1086,6 +874,7 @@ const Subprocess = struct {
     pub fn deinit(self: *Subprocess) void {
         self.stop();
         if (self.pty) |*pty| pty.deinit();
+        if (self.env) |*env| env.deinit();
         self.arena.deinit();
         self.* = undefined;
     }
@@ -1096,7 +885,13 @@ const Subprocess = struct {
         read: Pty.Fd,
         write: Pty.Fd,
     } {
-        assert(self.pty == null and self.command == null);
+        assert(self.pty == null and self.process == null);
+
+        // This function is funny because on POSIX systems it can
+        // fail in the forked process. This is flipped to true if
+        // we're in an error state in the forked process (child
+        // process).
+        var in_child: bool = false;
 
         // Create our pty
         var pty = try Pty.open(.{
@@ -1106,16 +901,74 @@ const Subprocess = struct {
             .ws_ypixel = @intCast(self.screen_size.height),
         });
         self.pty = pty;
-        errdefer {
+        errdefer if (!in_child) {
             if (comptime builtin.os.tag != .windows) {
                 _ = posix.close(pty.slave);
             }
 
             pty.deinit();
             self.pty = null;
-        }
+        };
 
-        log.debug("starting command command={s}", .{self.args});
+        // Cleanup we only run in our parent when we successfully start
+        // the process.
+        defer if (!in_child and self.process != null) {
+            if (comptime builtin.os.tag != .windows) {
+                // Once our subcommand is started we can close the slave
+                // side. This prevents the slave fd from being leaked to
+                // future children.
+                _ = posix.close(pty.slave);
+            }
+
+            // Successful start we can clear out some memory.
+            if (self.env) |*env| {
+                env.deinit();
+                self.env = null;
+            }
+        };
+
+        log.debug("starting command command={f}", .{ArgsFormatter{ .args = self.args }});
+
+        // If we can't access the cwd, then don't set any cwd and inherit.
+        // This is important because our cwd can be set by the shell (OSC 7)
+        // and we don't want to break new windows.
+        const cwd: ?[:0]const u8 = if (self.cwd) |proposed| cwd: {
+            if ((comptime build_config.flatpak) and internal_os.isFlatpak()) {
+                // Flatpak sandboxing prevents access to certain reserved paths
+                // regardless of configured permissions. Perform a test spawn
+                // to get around this problem
+                //
+                // https://docs.flatpak.org/en/latest/sandbox-permissions.html#reserved-paths
+                log.info("flatpak detected, will use host command to verify cwd access", .{});
+                const dev_null = try std.fs.cwd().openFile("/dev/null", .{ .mode = .read_write });
+                defer dev_null.close();
+                var cmd: internal_os.FlatpakHostCommand = .{
+                    .argv = &[_][]const u8{
+                        "/bin/sh",
+                        "-c",
+                        ":",
+                    },
+                    .cwd = proposed,
+                    .stdin = dev_null.handle,
+                    .stdout = dev_null.handle,
+                    .stderr = dev_null.handle,
+                };
+                _ = cmd.spawn(alloc) catch |err| {
+                    log.warn("cannot spawn command at cwd, ignoring: {}", .{err});
+                    break :cwd null;
+                };
+                _ = try cmd.wait();
+
+                break :cwd proposed;
+            }
+
+            if (std.fs.cwd().access(proposed, .{})) {
+                break :cwd proposed;
+            } else |err| {
+                log.warn("cannot access cwd, ignoring: {}", .{err});
+                break :cwd null;
+            }
+        } else null;
 
         // In flatpak, we use the HostCommand to execute our shell.
         if (internal_os.isFlatpak()) flatpak: {
@@ -1125,26 +978,22 @@ const Subprocess = struct {
             }
 
             // Flatpak command must have a stable pointer.
-            self.flatpak_command = .{
+            self.process = .{ .flatpak = .{
                 .argv = self.args,
-                .env = &self.env,
+                .cwd = cwd,
+                .env = if (self.env) |*env| env else null,
                 .stdin = pty.slave,
                 .stdout = pty.slave,
                 .stderr = pty.slave,
-            };
-            var cmd = &self.flatpak_command.?;
+            } };
+            var cmd = &self.process.?.flatpak;
             const pid = try cmd.spawn(alloc);
             errdefer killCommandFlatpak(cmd);
 
-            log.info("started subcommand on host via flatpak API path={s} pid={?}", .{
+            log.info("started subcommand on host via flatpak API path={s} pid={}", .{
                 self.args[0],
                 pid,
             });
-
-            // Once started, we can close the pty child side. We do this after
-            // wait right now but that is fine too. This lets us read the
-            // parent and detect EOF.
-            _ = posix.close(pty.slave);
 
             return .{
                 .read = pty.master,
@@ -1152,23 +1001,11 @@ const Subprocess = struct {
             };
         }
 
-        // If we can't access the cwd, then don't set any cwd and inherit.
-        // This is important because our cwd can be set by the shell (OSC 7)
-        // and we don't want to break new windows.
-        const cwd: ?[]const u8 = if (self.cwd) |proposed| cwd: {
-            if (std.fs.cwd().access(proposed, .{})) {
-                break :cwd proposed;
-            } else |err| {
-                log.warn("cannot access cwd, ignoring: {}", .{err});
-                break :cwd null;
-            }
-        } else null;
-
         // Build our subcommand
         var cmd: Command = .{
             .path = self.args[0],
             .args = self.args,
-            .env = &self.env,
+            .env = if (self.env) |*env| env else null,
             .cwd = cwd,
             .stdin = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
             .stdout = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
@@ -1186,7 +1023,22 @@ const Subprocess = struct {
             .data = self,
             .linux_cgroup = self.linux_cgroup,
         };
-        try cmd.start(alloc);
+
+        cmd.start(alloc) catch |err| {
+            // We have to do this because start on Windows can't
+            // ever return ExecFailedInChild
+            const StartError = error{ExecFailedInChild} || @TypeOf(err);
+            switch (@as(StartError, err)) {
+                // If we fail in our child we need to flag it so our
+                // errdefers don't run.
+                error.ExecFailedInChild => {
+                    in_child = true;
+                    return err;
+                },
+
+                else => return err,
+            }
+        };
         errdefer killCommand(&cmd) catch |err| {
             log.warn("error killing command during cleanup err={}", .{err});
         };
@@ -1195,14 +1047,7 @@ const Subprocess = struct {
             log.info("subcommand cgroup={s}", .{self.linux_cgroup orelse "-"});
         }
 
-        if (comptime builtin.os.tag != .windows) {
-            // Once our subcommand is started we can close the slave
-            // side. This prevents the slave fd from being leaked to
-            // future children.
-            _ = posix.close(pty.slave);
-        }
-
-        self.command = cmd;
+        self.process = .{ .fork_exec = cmd };
         return switch (builtin.os.tag) {
             .windows => .{
                 .read = pty.out_pipe,
@@ -1227,7 +1072,7 @@ const Subprocess = struct {
     /// Called to notify that we exited externally so we can unset our
     /// running state.
     pub fn externalExit(self: *Subprocess) void {
-        self.command = null;
+        self.process = null;
     }
 
     /// Stop the subprocess. This is safe to call anytime. This will wait
@@ -1235,25 +1080,23 @@ const Subprocess = struct {
     /// for it to terminate, so it will not block.
     /// This does not close the pty.
     pub fn stop(self: *Subprocess) void {
-        // Kill our command
-        if (self.command) |*cmd| {
-            // Note: this will also wait for the command to exit, so
-            // DO NOT call cmd.wait
-            killCommand(cmd) catch |err|
-                log.err("error sending SIGHUP to command, may hang: {}", .{err});
-            self.command = null;
-        }
+        switch (self.process orelse return) {
+            .fork_exec => |*cmd| {
+                // Note: this will also wait for the command to exit, so
+                // DO NOT call cmd.wait
+                killCommand(cmd) catch |err|
+                    log.err("error sending SIGHUP to command, may hang: {}", .{err});
+            },
 
-        // Kill our Flatpak command
-        if (FlatpakHostCommand != void) {
-            if (self.flatpak_command) |*cmd| {
+            .flatpak => |*cmd| if (comptime build_config.flatpak) {
                 killCommandFlatpak(cmd) catch |err|
                     log.err("error sending SIGHUP to command, may hang: {}", .{err});
                 _ = cmd.wait() catch |err|
                     log.err("error waiting for command to exit: {}", .{err});
-                self.flatpak_command = null;
-            }
+            },
         }
+
+        self.process = null;
     }
 
     /// Resize the pty subprocess. This is safe to call anytime.
@@ -1293,41 +1136,45 @@ const Subprocess = struct {
                     _ = try command.wait(false);
                 },
 
-                else => if (getpgid(pid)) |pgid| {
-                    // It is possible to send a killpg between the time that
-                    // our child process calls setsid but before or simultaneous
-                    // to calling execve. In this case, the direct child dies
-                    // but grandchildren survive. To work around this, we loop
-                    // and repeatedly kill the process group until all
-                    // descendents are well and truly dead. We will not rest
-                    // until the entire family tree is obliterated.
-                    while (true) {
-                        switch (posix.errno(c.killpg(pgid, c.SIGHUP))) {
-                            .SUCCESS => log.debug("process group killed pgid={}", .{pgid}),
-                            else => |err| killpg: {
-                                if ((comptime builtin.target.isDarwin()) and
-                                    err == .PERM)
-                                {
-                                    log.debug("killpg failed with EPERM, expected on Darwin and ignoring", .{});
-                                    break :killpg;
-                                }
+                else => try killPid(pid),
+            }
+        }
+    }
 
-                                log.warn("error killing process group pgid={} err={}", .{ pgid, err });
-                                return error.KillFailed;
-                            },
-                        }
+    fn killPid(pid: c.pid_t) !void {
+        const pgid = getpgid(pid) orelse return;
 
-                        // See Command.zig wait for why we specify WNOHANG.
-                        // The gist is that it lets us detect when children
-                        // are still alive without blocking so that we can
-                        // kill them again.
-                        const res = posix.waitpid(pid, std.c.W.NOHANG);
-                        log.debug("waitpid result={}", .{res.pid});
-                        if (res.pid != 0) break;
-                        std.time.sleep(10 * std.time.ns_per_ms);
+        // It is possible to send a killpg between the time that
+        // our child process calls setsid but before or simultaneous
+        // to calling execve. In this case, the direct child dies
+        // but grandchildren survive. To work around this, we loop
+        // and repeatedly kill the process group until all
+        // descendents are well and truly dead. We will not rest
+        // until the entire family tree is obliterated.
+        while (true) {
+            switch (posix.errno(c.killpg(pgid, c.SIGHUP))) {
+                .SUCCESS => log.debug("process group killed pgid={}", .{pgid}),
+                else => |err| killpg: {
+                    if ((comptime builtin.target.os.tag.isDarwin()) and
+                        err == .PERM)
+                    {
+                        log.debug("killpg failed with EPERM, expected on Darwin and ignoring", .{});
+                        break :killpg;
                     }
+
+                    log.warn("error killing process group pgid={} err={}", .{ pgid, err });
+                    return error.KillFailed;
                 },
             }
+
+            // See Command.zig wait for why we specify WNOHANG.
+            // The gist is that it lets us detect when children
+            // are still alive without blocking so that we can
+            // kill them again.
+            const res = posix.waitpid(pid, std.c.W.NOHANG);
+            log.debug("waitpid result={}", .{res.pid});
+            if (res.pid != 0) break;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
         }
     }
 
@@ -1347,7 +1194,7 @@ const Subprocess = struct {
             const pgid = c.getpgid(pid);
             if (pgid == my_pgid) {
                 log.warn("pgid is our own, retrying", .{});
-                std.time.sleep(10 * std.time.ns_per_ms);
+                std.Thread.sleep(10 * std.time.ns_per_ms);
                 continue;
             }
 
@@ -1394,6 +1241,13 @@ pub const ReadThread = struct {
     fn threadMainPosix(fd: posix.fd_t, io: *termio.Termio, quit: posix.fd_t) void {
         // Always close our end of the pipe when we exit.
         defer posix.close(quit);
+
+        // Right now, on Darwin, `std.Thread.setName` can only name the current
+        // thread, and we have no way to get the current thread from within it,
+        // so instead we use this code to name the thread instead.
+        if (builtin.os.tag.isDarwin()) {
+            internal_os.macos.pthread_setname_np(&"io-reader".*);
+        }
 
         // Setup our crash metadata
         crash.sentry.thread_state = .{
@@ -1531,3 +1385,354 @@ pub const ReadThread = struct {
         }
     }
 };
+
+/// Builds the argv array for the process we should exec for the
+/// configured command. This isn't as straightforward as it seems since
+/// we deal with shell-wrapping, macOS login shells, etc.
+///
+/// The passwdpkg comptime argument is expected to have a single function
+/// `get(Allocator)` that returns a passwd entry. This is used by macOS
+/// to determine the username and home directory for the login shell.
+/// It is unused on other platforms.
+///
+/// Memory ownership:
+///
+/// The allocator should be an arena, since the returned value may or
+/// may not be allocated and args may or may not be allocated (or copied).
+/// Pointers in the return value may point to pointers in the command
+/// struct.
+fn execCommand(
+    alloc: Allocator,
+    command: configpkg.Command,
+    comptime passwdpkg: type,
+) (Allocator.Error || error{SystemError})![]const [:0]const u8 {
+    // If we're on macOS, we have to use `login(1)` to get all of
+    // the proper environment variables set, a login shell, and proper
+    // hushlogin behavior.
+    if (comptime builtin.target.os.tag.isDarwin()) darwin: {
+        const passwd = passwdpkg.get(alloc) catch |err| {
+            log.warn("failed to read passwd, not using a login shell err={}", .{err});
+            break :darwin;
+        };
+
+        const username = passwd.name orelse {
+            log.warn("failed to get username, not using a login shell", .{});
+            break :darwin;
+        };
+
+        const hush = if (passwd.home) |home| hush: {
+            var dir = std.fs.openDirAbsolute(home, .{}) catch |err| {
+                log.warn(
+                    "failed to open home dir, not checking for hushlogin err={}",
+                    .{err},
+                );
+                break :hush false;
+            };
+            defer dir.close();
+
+            break :hush if (dir.access(".hushlogin", .{})) true else |_| false;
+        } else false;
+
+        // If we made it this far we're going to start building
+        // the actual command.
+        var args: std.ArrayList([:0]const u8) = try .initCapacity(
+            alloc,
+
+            // This capacity is chosen based on what we'd need to
+            // execute a shell command (very common). We can/will
+            // grow if necessary for a longer command (uncommon).
+            9,
+        );
+        defer args.deinit(alloc);
+
+        // The reason for executing login this way is unclear. This
+        // comment will attempt to explain but prepare for a truly
+        // unhinged reality.
+        //
+        // The first major issue is that on macOS, a lot of users
+        // put shell configurations in ~/.bash_profile instead of
+        // ~/.bashrc (or equivalent for another shell). This file is only
+        // loaded for a login shell so macOS users expect all their terminals
+        // to be login shells. No other platform behaves this way and its
+        // totally braindead but somehow the entire dev community on
+        // macOS has cargo culted their way to this reality so we have to
+        // do it...
+        //
+        // To get a login shell, you COULD just prepend argv0 with a `-`
+        // but that doesn't fully work because `getlogin()` C API will
+        // return the wrong value, SHELL won't be set, and various
+        // other login behaviors that macOS users expect.
+        //
+        // The proper way is to use `login(1)`. But login(1) forces
+        // the working directory to change to the home directory,
+        // which we may not want. If we specify "-l" then we can avoid
+        // this behavior but now the shell isn't a login shell.
+        //
+        // There is another issue: `login(1)` on macOS 14.3 and earlier
+        // checked for ".hushlogin" in the working directory. This means
+        // that if we specify "-l" then we won't get hushlogin honored
+        // if its in the home directory (which is standard). To get
+        // around this, we check for hushlogin ourselves and if present
+        // specify the "-q" flag to login(1).
+        //
+        // So to get all the behaviors we want, we specify "-l" but
+        // execute "bash" (which is built-in to macOS). We then use
+        // the bash builtin "exec" to replace the process with a login
+        // shell ("-l" on exec) with the command we really want.
+        //
+        // We use "bash" instead of other shells that ship with macOS
+        // because as of macOS Sonoma, we found with a microbenchmark
+        // that bash can `exec` into the desired command ~2x faster
+        // than zsh.
+        //
+        // To figure out a lot of this logic I read the login.c
+        // source code in the OSS distribution Apple provides for
+        // macOS.
+        //
+        // Awesome.
+        try args.append(alloc, "/usr/bin/login");
+        if (hush) try args.append(alloc, "-q");
+        try args.append(alloc, "-flp");
+        try args.append(alloc, username);
+
+        switch (command) {
+            // Direct args can be passed directly to login, since
+            // login uses execvp we don't need to worry about PATH
+            // searching.
+            .direct => |v| try args.appendSlice(alloc, v),
+
+            .shell => |v| {
+                // Use "exec" to replace the bash process with
+                // our intended command so we don't have a parent
+                // process hanging around.
+                const cmd = try std.fmt.allocPrintSentinel(
+                    alloc,
+                    "exec -l {s}",
+                    .{v},
+                    0,
+                );
+
+                // We execute bash with "--noprofile --norc" so that it doesn't
+                // load startup files so that (1) our shell integration doesn't
+                // break and (2) user configuration doesn't mess this process
+                // up.
+                try args.append(alloc, "/bin/bash");
+                try args.append(alloc, "--noprofile");
+                try args.append(alloc, "--norc");
+                try args.append(alloc, "-c");
+                try args.append(alloc, cmd);
+            },
+        }
+
+        return try args.toOwnedSlice(alloc);
+    }
+
+    return switch (command) {
+        // We need to clone the command since there's no guarantee the config remains valid.
+        .direct => |_| (try command.clone(alloc)).direct,
+
+        .shell => |v| shell: {
+            var args: std.ArrayList([:0]const u8) = try .initCapacity(alloc, 4);
+            defer args.deinit(alloc);
+
+            if (comptime builtin.os.tag == .windows) {
+                // We run our shell wrapped in `cmd.exe` so that we don't have
+                // to parse the command line ourselves if it has arguments.
+
+                // Note we don't free any of the memory below since it is
+                // allocated in the arena.
+                const windir = std.process.getEnvVarOwned(
+                    alloc,
+                    "WINDIR",
+                ) catch |err| {
+                    log.warn("failed to get WINDIR, cannot run shell command err={}", .{err});
+                    return error.SystemError;
+                };
+                const cmd = try std.fs.path.joinZ(alloc, &[_][]const u8{
+                    windir,
+                    "System32",
+                    "cmd.exe",
+                });
+
+                try args.append(alloc, cmd);
+                try args.append(alloc, "/C");
+            } else {
+                // We run our shell wrapped in `/bin/sh` so that we don't have
+                // to parse the command line ourselves if it has arguments.
+                // Additionally, some environments (NixOS, I found) use /bin/sh
+                // to setup some environment variables that are important to
+                // have set.
+                try args.append(alloc, "/bin/sh");
+                if (internal_os.isFlatpak()) try args.append(alloc, "-l");
+                try args.append(alloc, "-c");
+            }
+
+            try args.append(alloc, v);
+            break :shell try args.toOwnedSlice(alloc);
+        },
+    };
+}
+
+test "execCommand darwin: shell command" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try execCommand(alloc, .{ .shell = "foo bar baz" }, struct {
+        fn get(_: Allocator) !PasswdEntry {
+            return .{
+                .name = "testuser",
+            };
+        }
+    });
+
+    try testing.expectEqual(8, result.len);
+    try testing.expectEqualStrings(result[0], "/usr/bin/login");
+    try testing.expectEqualStrings(result[1], "-flp");
+    try testing.expectEqualStrings(result[2], "testuser");
+    try testing.expectEqualStrings(result[3], "/bin/bash");
+    try testing.expectEqualStrings(result[4], "--noprofile");
+    try testing.expectEqualStrings(result[5], "--norc");
+    try testing.expectEqualStrings(result[6], "-c");
+    try testing.expectEqualStrings(result[7], "exec -l foo bar baz");
+}
+
+test "execCommand darwin: direct command" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try execCommand(alloc, .{ .direct = &.{
+        "foo",
+        "bar baz",
+    } }, struct {
+        fn get(_: Allocator) !PasswdEntry {
+            return .{
+                .name = "testuser",
+            };
+        }
+    });
+
+    try testing.expectEqual(5, result.len);
+    try testing.expectEqualStrings(result[0], "/usr/bin/login");
+    try testing.expectEqualStrings(result[1], "-flp");
+    try testing.expectEqualStrings(result[2], "testuser");
+    try testing.expectEqualStrings(result[3], "foo");
+    try testing.expectEqualStrings(result[4], "bar baz");
+}
+
+test "execCommand: shell command, empty passwd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try execCommand(
+        alloc,
+        .{ .shell = "foo bar baz" },
+        struct {
+            fn get(_: Allocator) !PasswdEntry {
+                // Empty passwd entry means we can't construct a macOS
+                // login command and falls back to POSIX behavior.
+                return .{};
+            }
+        },
+    );
+
+    try testing.expectEqual(3, result.len);
+    try testing.expectEqualStrings(result[0], "/bin/sh");
+    try testing.expectEqualStrings(result[1], "-c");
+    try testing.expectEqualStrings(result[2], "foo bar baz");
+}
+
+test "execCommand: shell command, error passwd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try execCommand(
+        alloc,
+        .{ .shell = "foo bar baz" },
+        struct {
+            fn get(_: Allocator) !PasswdEntry {
+                // Failed passwd entry means we can't construct a macOS
+                // login command and falls back to POSIX behavior.
+                return error.Fail;
+            }
+        },
+    );
+
+    try testing.expectEqual(3, result.len);
+    try testing.expectEqualStrings(result[0], "/bin/sh");
+    try testing.expectEqualStrings(result[1], "-c");
+    try testing.expectEqualStrings(result[2], "foo bar baz");
+}
+
+test "execCommand: direct command, error passwd" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const result = try execCommand(alloc, .{
+        .direct = &.{
+            "foo",
+            "bar baz",
+        },
+    }, struct {
+        fn get(_: Allocator) !PasswdEntry {
+            // Failed passwd entry means we can't construct a macOS
+            // login command and falls back to POSIX behavior.
+            return error.Fail;
+        }
+    });
+
+    try testing.expectEqual(2, result.len);
+    try testing.expectEqualStrings(result[0], "foo");
+    try testing.expectEqualStrings(result[1], "bar baz");
+}
+
+test "execCommand: direct command, config freed" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var command_arena = ArenaAllocator.init(testing.allocator);
+    const command_alloc = command_arena.allocator();
+    const command = try (configpkg.Command{
+        .direct = &.{
+            "foo",
+            "bar baz",
+        },
+    }).clone(command_alloc);
+
+    const result = try execCommand(alloc, command, struct {
+        fn get(_: Allocator) !PasswdEntry {
+            // Failed passwd entry means we can't construct a macOS
+            // login command and falls back to POSIX behavior.
+            return error.Fail;
+        }
+    });
+
+    command_arena.deinit();
+
+    try testing.expectEqual(2, result.len);
+    try testing.expectEqualStrings(result[0], "foo");
+    try testing.expectEqualStrings(result[1], "bar baz");
+}

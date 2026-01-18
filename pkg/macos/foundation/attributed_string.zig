@@ -10,7 +10,7 @@ pub const AttributedString = opaque {
         str: *foundation.String,
         attributes: *foundation.Dictionary,
     ) Allocator.Error!*AttributedString {
-        return @constCast(@ptrCast(c.CFAttributedStringCreate(
+        return @ptrCast(@constCast(c.CFAttributedStringCreate(
             null,
             @ptrCast(str),
             @ptrCast(attributes),
@@ -67,7 +67,7 @@ pub const MutableAttributedString = opaque {
     ) void {
         const T = @TypeOf(key);
         const info = @typeInfo(T);
-        const Key = if (info != .Pointer) T else info.Pointer.child;
+        const Key = if (info != .pointer) T else info.pointer.child;
         const key_arg = if (@hasDecl(Key, "key"))
             key.key()
         else

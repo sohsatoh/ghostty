@@ -1,17 +1,19 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const build_config = @import("../build_config.zig");
+const build_options = @import("terminal_options");
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
 const testing = std.testing;
 const posix = std.posix;
 const fastmem = @import("../fastmem.zig");
 const color = @import("color.zig");
 const hyperlink = @import("hyperlink.zig");
 const kitty = @import("kitty.zig");
-const sgr = @import("sgr.zig");
-const style = @import("style.zig");
+const stylepkg = @import("style.zig");
+const Style = stylepkg.Style;
+const StyleId = stylepkg.Id;
+const StyleSet = stylepkg.Set;
 const size = @import("size.zig");
 const getOffset = size.getOffset;
 const Offset = size.Offset;
@@ -34,7 +36,7 @@ const grapheme_chunk_len = 4;
 const grapheme_chunk = grapheme_chunk_len * @sizeOf(u21);
 const GraphemeAlloc = BitmapAllocator(grapheme_chunk);
 const grapheme_count_default = GraphemeAlloc.bitmap_bit_size;
-const grapheme_bytes_default = grapheme_count_default * grapheme_chunk;
+pub const grapheme_bytes_default = grapheme_count_default * grapheme_chunk;
 const GraphemeMap = AutoOffsetHashMap(Offset(Cell), Offset(u21).Slice);
 
 /// The allocator used for shared utf8-encoded strings within a page.
@@ -53,7 +55,7 @@ const string_chunk_len = 32;
 const string_chunk = string_chunk_len * @sizeOf(u8);
 const StringAlloc = BitmapAllocator(string_chunk);
 const string_count_default = StringAlloc.bitmap_bit_size;
-const string_bytes_default = string_count_default * string_chunk;
+pub const string_bytes_default = string_count_default * string_chunk;
 
 /// Default number of hyperlinks we support.
 ///
@@ -83,17 +85,17 @@ pub const Page = struct {
     comptime {
         // The alignment of our members. We want to ensure that the page
         // alignment is always divisible by this.
-        assert(std.mem.page_size % @max(
+        assert(std.heap.page_size_min % @max(
             @alignOf(Row),
             @alignOf(Cell),
-            style.Set.base_align,
+            StyleSet.base_align.toByteUnits(),
         ) == 0);
     }
 
     /// The backing memory for the page. A page is always made up of a
     /// a single contiguous block of memory that is aligned on a page
     /// boundary and is a multiple of the system page size.
-    memory: []align(std.mem.page_size) u8,
+    memory: []align(std.heap.page_size_min) u8,
 
     /// The array of rows in the page. The rows are always in row order
     /// (i.e. index 0 is the top row, index 1 is the row below that, etc.)
@@ -104,6 +106,15 @@ pub const Page = struct {
     /// to row, you must use the `rows` field. From the pointer to the
     /// first column, all cells in that row are laid out in column order.
     cells: Offset(Cell),
+
+    /// Set to true when an operation is performed that dirties all rows in
+    /// the page. See `Row.dirty` for more information on dirty tracking.
+    ///
+    /// NOTE: A value of false does NOT indicate that
+    ///       the page has no dirty rows in it, only
+    ///       that no full-page-dirtying operations
+    ///       have occurred since it was last cleared.
+    dirty: bool,
 
     /// The string allocator for this page used for shared utf-8 encoded
     /// strings. Liveness of strings and memory management is deferred to
@@ -124,7 +135,7 @@ pub const Page = struct {
     grapheme_map: GraphemeMap,
 
     /// The available set of styles in use on this page.
-    styles: style.Set,
+    styles: StyleSet,
 
     /// The structures used for tracking hyperlinks within the page.
     /// The map maps cell offsets to hyperlink IDs and the IDs are in
@@ -132,44 +143,6 @@ pub const Page = struct {
     /// are allocated in the string allocator.
     hyperlink_map: hyperlink.Map,
     hyperlink_set: hyperlink.Set,
-
-    /// The offset to the first mask of dirty bits in the page.
-    ///
-    /// The dirty bits is a contiguous array of usize where each bit represents
-    /// a row in the page, in order. If the bit is set, then the row is dirty
-    /// and requires a redraw. Dirty status is only ever meant to convey that
-    /// a cell has changed visually. A cell which changes in a way that doesn't
-    /// affect the visual representation may not be marked as dirty.
-    ///
-    /// Dirty tracking may have false positives but should never have false
-    /// negatives. A false negative would result in a visual artifact on the
-    /// screen.
-    ///
-    /// Dirty bits are only ever unset by consumers of a page. The page
-    /// structure itself does not unset dirty bits since the page does not
-    /// know when a cell has been redrawn.
-    ///
-    /// As implementation background: it may seem that dirty bits should be
-    /// stored elsewhere and not on the page itself, because the only data
-    /// that could possibly change is in the active area of a terminal
-    /// historically and that area is small compared to the typical scrollback.
-    /// My original thinking was to put the dirty bits on Screen instead and
-    /// have them only track the active area. However, I decided to put them
-    /// into the page directly for a few reasons:
-    ///
-    ///   1. It's simpler. The page is a self-contained unit and it's nice
-    ///      to have all the data for a page in one place.
-    ///
-    ///   2. It's cheap. Even a very large page might have 1000 rows and
-    ///      that's only ~128 bytes of 64-bit integers to track all the dirty
-    ///      bits. Compared to the hundreds of kilobytes a typical page
-    ///      consumes, this is nothing.
-    ///
-    ///   3. It's more flexible. If we ever want to implement new terminal
-    ///      features that allow non-active area to be dirty, we can do that
-    ///      with minimal dirty-tracking work.
-    ///
-    dirty: Offset(usize),
 
     /// The current dimensions of the page. The capacity may be larger
     /// than this. This allows us to allocate a larger page than necessary
@@ -182,8 +155,8 @@ pub const Page = struct {
 
     /// If this is true then verifyIntegrity will do nothing. This is
     /// only present with runtime safety enabled.
-    pause_integrity_checks: if (build_config.slow_runtime_safety) usize else void =
-        if (build_config.slow_runtime_safety) 0 else {},
+    pause_integrity_checks: if (build_options.slow_runtime_safety) usize else void =
+        if (build_options.slow_runtime_safety) 0 else {},
 
     /// Initialize a new page, allocating the required backing memory.
     /// The size of the initialized page defaults to the full capacity.
@@ -191,14 +164,14 @@ pub const Page = struct {
     /// The backing memory is always allocated using mmap directly.
     /// You cannot use custom allocators with this structure because
     /// it is critical to performance that we use mmap.
-    pub fn init(cap: Capacity) !Page {
+    pub inline fn init(cap: Capacity) !Page {
         const l = layout(cap);
 
         // We use mmap directly to avoid Zig allocator overhead
         // (small but meaningful for this path) and because a private
         // anonymous mmap is guaranteed on Linux and macOS to be zeroed,
         // which is a critical property for us.
-        assert(l.total_size % std.mem.page_size == 0);
+        assert(l.total_size % std.heap.page_size_min == 0);
         const backing = try posix.mmap(
             null,
             l.total_size,
@@ -215,7 +188,7 @@ pub const Page = struct {
 
     /// Initialize a new page using the given backing memory.
     /// It is up to the caller to not call deinit on these pages.
-    pub fn initBuf(buf: OffsetBuf, l: Layout) Page {
+    pub inline fn initBuf(buf: OffsetBuf, l: Layout) Page {
         const cap = l.capacity;
         const rows = buf.member(Row, l.rows_start);
         const cells = buf.member(Cell, l.cells_start);
@@ -223,7 +196,8 @@ pub const Page = struct {
         // We need to go through and initialize all the rows so that
         // they point to a valid offset into the cells, since the rows
         // zero-initialized aren't valid.
-        const cells_ptr = cells.ptr(buf)[0 .. cap.cols * cap.rows];
+        const cells_len = @as(usize, cap.cols) * @as(usize, cap.rows);
+        const cells_ptr = cells.ptr(buf)[0..cells_len];
         for (rows.ptr(buf)[0..cap.rows], 0..) |*row, y| {
             const start = y * cap.cols;
             row.* = .{
@@ -235,52 +209,52 @@ pub const Page = struct {
             .memory = @alignCast(buf.start()[0..l.total_size]),
             .rows = rows,
             .cells = cells,
-            .dirty = buf.member(usize, l.dirty_start),
-            .styles = style.Set.init(
+            .styles = StyleSet.init(
                 buf.add(l.styles_start),
                 l.styles_layout,
                 .{},
             ),
-            .string_alloc = StringAlloc.init(
+            .string_alloc = .init(
                 buf.add(l.string_alloc_start),
                 l.string_alloc_layout,
             ),
-            .grapheme_alloc = GraphemeAlloc.init(
+            .grapheme_alloc = .init(
                 buf.add(l.grapheme_alloc_start),
                 l.grapheme_alloc_layout,
             ),
-            .grapheme_map = GraphemeMap.init(
+            .grapheme_map = .init(
                 buf.add(l.grapheme_map_start),
                 l.grapheme_map_layout,
             ),
-            .hyperlink_map = hyperlink.Map.init(
+            .hyperlink_map = .init(
                 buf.add(l.hyperlink_map_start),
                 l.hyperlink_map_layout,
             ),
-            .hyperlink_set = hyperlink.Set.init(
+            .hyperlink_set = .init(
                 buf.add(l.hyperlink_set_start),
                 l.hyperlink_set_layout,
                 .{},
             ),
             .size = .{ .cols = cap.cols, .rows = cap.rows },
             .capacity = cap,
+            .dirty = false,
         };
     }
 
     /// Deinitialize the page, freeing any backing memory. Do NOT call
     /// this if you allocated the backing memory yourself (i.e. you used
     /// initBuf).
-    pub fn deinit(self: *Page) void {
+    pub inline fn deinit(self: *Page) void {
         posix.munmap(self.memory);
         self.* = undefined;
     }
 
     /// Reinitialize the page with the same capacity.
-    pub fn reinit(self: *Page) void {
+    pub inline fn reinit(self: *Page) void {
         // We zero the page memory as u64 instead of u8 because
         // we can and it's empirically quite a bit faster.
         @memset(@as([*]u64, @ptrCast(self.memory))[0 .. self.memory.len / 8], 0);
-        self.* = initBuf(OffsetBuf.init(self.memory), layout(self.capacity));
+        self.* = initBuf(.init(self.memory), layout(self.capacity));
     }
 
     pub const IntegrityError = error{
@@ -306,8 +280,8 @@ pub const Page = struct {
     /// Temporarily pause integrity checks. This is useful when you are
     /// doing a lot of operations that would trigger integrity check
     /// violations but you know the page will end up in a consistent state.
-    pub fn pauseIntegrityChecks(self: *Page, v: bool) void {
-        if (build_config.slow_runtime_safety) {
+    pub inline fn pauseIntegrityChecks(self: *Page, v: bool) void {
+        if (build_options.slow_runtime_safety) {
             if (v) {
                 self.pause_integrity_checks += 1;
             } else {
@@ -319,9 +293,12 @@ pub const Page = struct {
     /// A helper that can be used to assert the integrity of the page
     /// when runtime safety is enabled. This is a no-op when runtime
     /// safety is disabled. This uses the libc allocator.
-    pub fn assertIntegrity(self: *const Page) void {
-        if (comptime build_config.slow_runtime_safety) {
-            self.verifyIntegrity(std.heap.c_allocator) catch |err| {
+    pub inline fn assertIntegrity(self: *const Page) void {
+        if (comptime build_options.slow_runtime_safety) {
+            var debug_allocator: std.heap.DebugAllocator(.{}) = .init;
+            defer _ = debug_allocator.deinit();
+            const alloc = debug_allocator.allocator();
+            self.verifyIntegrity(alloc) catch |err| {
                 log.err("page integrity violation, crashing. err={}", .{err});
                 @panic("page integrity violation");
             };
@@ -346,7 +323,12 @@ pub const Page = struct {
         //   used for the same reason as styles above.
         //
 
-        if (build_config.slow_runtime_safety) {
+        // We don't run integrity checks on Valgrind because its soooooo slow,
+        // Valgrind is our integrity checker, and we run these during unit
+        // tests (non-Valgrind) anyways so we're verifying anyways.
+        if (std.valgrind.runningOnValgrind() > 0) return;
+
+        if (build_options.slow_runtime_safety) {
             if (self.pause_integrity_checks > 0) return;
         }
 
@@ -364,7 +346,7 @@ pub const Page = struct {
         const alloc = arena.allocator();
 
         var graphemes_seen: usize = 0;
-        var styles_seen = std.AutoHashMap(style.Id, usize).init(alloc);
+        var styles_seen = std.AutoHashMap(StyleId, usize).init(alloc);
         defer styles_seen.deinit();
         var hyperlinks_seen = std.AutoHashMap(hyperlink.Id, usize).init(alloc);
         defer hyperlinks_seen.deinit();
@@ -401,7 +383,7 @@ pub const Page = struct {
                     }
                 }
 
-                if (cell.style_id != style.default_id) {
+                if (cell.style_id != stylepkg.default_id) {
                     // If a cell has a style, it must be present in the styles
                     // set. Accessing it with `get` asserts that.
                     _ = self.styles.get(
@@ -595,7 +577,7 @@ pub const Page = struct {
     /// Clone the contents of this page. This will allocate new memory
     /// using the page allocator. If you want to manage memory manually,
     /// use cloneBuf.
-    pub fn clone(self: *const Page) !Page {
+    pub inline fn clone(self: *const Page) !Page {
         const backing = try posix.mmap(
             null,
             self.memory.len,
@@ -611,7 +593,7 @@ pub const Page = struct {
     /// Clone the entire contents of this page.
     ///
     /// The buffer must be at least the size of self.memory.
-    pub fn cloneBuf(self: *const Page, buf: []align(std.mem.page_size) u8) Page {
+    pub inline fn cloneBuf(self: *const Page, buf: []align(std.heap.page_size_min) u8) Page {
         assert(buf.len >= self.memory.len);
 
         // The entire concept behind a page is that everything is stored
@@ -663,7 +645,7 @@ pub const Page = struct {
     /// If the other page has more columns, the extra columns will be
     /// truncated. If the other page has fewer columns, the extra columns
     /// will be zeroed.
-    pub fn cloneFrom(
+    pub inline fn cloneFrom(
         self: *Page,
         other: *const Page,
         y_start: usize,
@@ -675,11 +657,8 @@ pub const Page = struct {
 
         const other_rows = other.rows.ptr(other.memory)[y_start..y_end];
         const rows = self.rows.ptr(self.memory)[0 .. y_end - y_start];
-        const other_dirty_set = other.dirtyBitSet();
-        var dirty_set = self.dirtyBitSet();
-        for (rows, 0.., other_rows, y_start..) |*dst_row, dst_y, *src_row, src_y| {
+        for (rows, other_rows) |*dst_row, *src_row| {
             try self.cloneRowFrom(other, dst_row, src_row);
-            if (other_dirty_set.isSet(src_y)) dirty_set.set(dst_y);
         }
 
         // We should remain consistent
@@ -687,7 +666,7 @@ pub const Page = struct {
     }
 
     /// Clone a single row from another page into this page.
-    pub fn cloneRowFrom(
+    pub inline fn cloneRowFrom(
         self: *Page,
         other: *const Page,
         dst_row: *Row,
@@ -741,6 +720,7 @@ pub const Page = struct {
                 copy.grapheme = dst_row.grapheme;
                 copy.hyperlink = dst_row.hyperlink;
                 copy.styled = dst_row.styled;
+                copy.dirty |= dst_row.dirty;
             }
 
             // Our cell offset remains the same
@@ -755,11 +735,11 @@ pub const Page = struct {
             // This is an integrity check: if the row claims it doesn't
             // have managed memory then all cells must also not have
             // managed memory.
-            if (build_config.slow_runtime_safety) {
+            if (build_options.slow_runtime_safety) {
                 for (other_cells) |cell| {
                     assert(!cell.hasGrapheme());
                     assert(!cell.hyperlink);
-                    assert(cell.style_id == style.default_id);
+                    assert(cell.style_id == stylepkg.default_id);
                 }
             }
 
@@ -774,18 +754,12 @@ pub const Page = struct {
                 // hit an integrity check if we have to return an error because
                 // the page can't fit the new memory.
                 dst_cell.hyperlink = false;
-                dst_cell.style_id = style.default_id;
+                dst_cell.style_id = stylepkg.default_id;
                 if (dst_cell.content_tag == .codepoint_grapheme) {
                     dst_cell.content_tag = .codepoint;
                 }
 
                 if (src_cell.hasGrapheme()) {
-                    // To prevent integrity checks flipping. This will
-                    // get fixed up when we check the style id below.
-                    if (build_config.slow_runtime_safety) {
-                        dst_cell.style_id = style.default_id;
-                    }
-
                     // Copy the grapheme codepoints
                     const cps = other.lookupGrapheme(src_cell).?;
 
@@ -821,11 +795,7 @@ pub const Page = struct {
                         if (self.hyperlink_set.lookupContext(
                             self.memory,
                             other_link.*,
-
-                            // `lookupContext` uses the context for hashing, and
-                            // that doesn't write to the page, so this constCast
-                            // is completely safe.
-                            .{ .page = @constCast(other) },
+                            .{ .page = self, .src_page = @constCast(other) },
                         )) |i| {
                             self.hyperlink_set.use(self.memory, i);
                             break :dst_id i;
@@ -863,7 +833,7 @@ pub const Page = struct {
 
                     try self.setHyperlink(dst_row, dst_cell, dst_id);
                 }
-                if (src_cell.style_id != style.default_id) style: {
+                if (src_cell.style_id != stylepkg.default_id) style: {
                     dst_row.styled = true;
 
                     if (other == self) {
@@ -889,8 +859,10 @@ pub const Page = struct {
                         error.NeedsRehash => return error.StyleSetNeedsRehash,
                     } orelse src_cell.style_id;
                 }
-                if (src_cell.codepoint() == kitty.graphics.unicode.placeholder) {
-                    dst_row.kitty_virtual_placeholder = true;
+                if (comptime build_options.kitty_graphics) {
+                    if (src_cell.codepoint() == kitty.graphics.unicode.placeholder) {
+                        dst_row.kitty_virtual_placeholder = true;
+                    }
                 }
             }
         }
@@ -906,14 +878,14 @@ pub const Page = struct {
     }
 
     /// Get a single row. y must be valid.
-    pub fn getRow(self: *const Page, y: usize) *Row {
+    pub inline fn getRow(self: *const Page, y: usize) *Row {
         assert(y < self.size.rows);
         return &self.rows.ptr(self.memory)[y];
     }
 
     /// Get the cells for a row.
-    pub fn getCells(self: *const Page, row: *Row) []Cell {
-        if (build_config.slow_runtime_safety) {
+    pub inline fn getCells(self: *const Page, row: *Row) []Cell {
+        if (build_options.slow_runtime_safety) {
             const rows = self.rows.ptr(self.memory);
             const cells = self.cells.ptr(self.memory);
             assert(@intFromPtr(row) >= @intFromPtr(rows));
@@ -925,7 +897,7 @@ pub const Page = struct {
     }
 
     /// Get the row and cell for the given X/Y within this page.
-    pub fn getRowAndCell(self: *const Page, x: usize, y: usize) struct {
+    pub inline fn getRowAndCell(self: *const Page, x: usize, y: usize) struct {
         row: *Row,
         cell: *Cell,
     } {
@@ -979,15 +951,17 @@ pub const Page = struct {
                     dst.hyperlink = true;
                     dst_row.hyperlink = true;
                 }
-                if (src.codepoint() == kitty.graphics.unicode.placeholder) {
-                    dst_row.kitty_virtual_placeholder = true;
+                if (comptime build_options.kitty_graphics) {
+                    if (src.codepoint() == kitty.graphics.unicode.placeholder) {
+                        dst_row.kitty_virtual_placeholder = true;
+                    }
                 }
             }
         }
 
         // The destination row has styles if any of the cells are styled
         if (!dst_row.styled) dst_row.styled = styled: for (dst_cells) |c| {
-            if (c.style_id != style.default_id) break :styled true;
+            if (c.style_id != stylepkg.default_id) break :styled true;
         } else false;
 
         // Clear our source row now that the copy is complete. We can NOT
@@ -1001,12 +975,14 @@ pub const Page = struct {
             src_row.grapheme = false;
             src_row.hyperlink = false;
             src_row.styled = false;
-            src_row.kitty_virtual_placeholder = false;
+            if (comptime build_options.kitty_graphics) {
+                src_row.kitty_virtual_placeholder = false;
+            }
         }
     }
 
     /// Swap two cells within the same row as quickly as possible.
-    pub fn swapCells(
+    pub inline fn swapCells(
         self: *Page,
         src: *Cell,
         dst: *Cell,
@@ -1067,7 +1043,7 @@ pub const Page = struct {
     /// active, Page cannot know this and it will still be ref counted down.
     /// The best solution for this is to artificially increment the ref count
     /// prior to calling this function.
-    pub fn clearCells(
+    pub inline fn clearCells(
         self: *Page,
         row: *Row,
         left: usize,
@@ -1077,36 +1053,66 @@ pub const Page = struct {
 
         const cells = row.cells.ptr(self.memory)[left..end];
 
+        // If we have managed memory (styles, graphemes, or hyperlinks)
+        // in this row then we go cell by cell and clear them if present.
         if (row.grapheme) {
             for (cells) |*cell| {
-                if (cell.hasGrapheme()) self.clearGrapheme(row, cell);
+                if (cell.hasGrapheme())
+                    @call(.always_inline, clearGrapheme, .{ self, cell });
+            }
+
+            // If we have no left/right scroll region we can be sure
+            // that we've cleared all the graphemes, so we clear the
+            // flag, otherwise we use the update function to update.
+            if (cells.len == self.size.cols) {
+                row.grapheme = false;
+            } else {
+                self.updateRowGraphemeFlag(row);
             }
         }
 
         if (row.hyperlink) {
             for (cells) |*cell| {
-                if (cell.hyperlink) self.clearHyperlink(row, cell);
+                if (cell.hyperlink)
+                    @call(.always_inline, clearHyperlink, .{ self, cell });
+            }
+
+            // If we have no left/right scroll region we can be sure
+            // that we've cleared all the hyperlinks, so we clear the
+            // flag, otherwise we use the update function to update.
+            if (cells.len == self.size.cols) {
+                row.hyperlink = false;
+            } else {
+                self.updateRowHyperlinkFlag(row);
             }
         }
 
         if (row.styled) {
             for (cells) |*cell| {
-                if (cell.style_id == style.default_id) continue;
-
-                self.styles.release(self.memory, cell.style_id);
+                if (cell.hasStyling())
+                    self.styles.release(self.memory, cell.style_id);
             }
 
-            if (cells.len == self.size.cols) row.styled = false;
+            // If we have no left/right scroll region we can be sure
+            // that we've cleared all the styles, so we clear the
+            // flag, otherwise we use the update function to update.
+            if (cells.len == self.size.cols) {
+                row.styled = false;
+            } else {
+                self.updateRowStyledFlag(row);
+            }
         }
 
-        if (row.kitty_virtual_placeholder and
-            cells.len == self.size.cols)
-        {
-            for (cells) |c| {
-                if (c.codepoint() == kitty.graphics.unicode.placeholder) {
-                    break;
-                }
-            } else row.kitty_virtual_placeholder = false;
+        if (comptime build_options.kitty_graphics) {
+            if (row.kitty_virtual_placeholder and
+                cells.len == self.size.cols)
+            {
+                for (cells) |c| {
+                    if (c.codepoint() == kitty.graphics.unicode.placeholder) {
+                        break;
+                    }
+                } else row.kitty_virtual_placeholder = false;
+            }
         }
 
         // Zero the cells as u64s since empirically this seems
@@ -1115,14 +1121,18 @@ pub const Page = struct {
     }
 
     /// Returns the hyperlink ID for the given cell.
-    pub fn lookupHyperlink(self: *const Page, cell: *const Cell) ?hyperlink.Id {
+    pub inline fn lookupHyperlink(self: *const Page, cell: *const Cell) ?hyperlink.Id {
         const cell_offset = getOffset(Cell, self.memory, cell);
         const map = self.hyperlink_map.map(self.memory);
         return map.get(cell_offset);
     }
 
     /// Clear the hyperlink from the given cell.
-    pub fn clearHyperlink(self: *Page, row: *Row, cell: *Cell) void {
+    ///
+    /// In order to update the hyperlink flag on the row, call
+    /// `updateRowHyperlinkFlag` after you finish clearing any
+    /// hyperlinks in the row.
+    pub fn clearHyperlink(self: *Page, cell: *Cell) void {
         defer self.assertIntegrity();
 
         // Get our ID
@@ -1134,9 +1144,13 @@ pub const Page = struct {
         self.hyperlink_set.release(self.memory, entry.value_ptr.*);
         map.removeByPtr(entry.key_ptr);
         cell.hyperlink = false;
+    }
 
-        // Mark that we no longer have hyperlinks, also search the row
-        // to make sure its state is correct.
+    /// Checks if the row contains any hyperlinks and sets
+    /// the hyperlink flag to false if none are found.
+    ///
+    /// Call after removing hyperlinks in a row.
+    pub inline fn updateRowHyperlinkFlag(self: *Page, row: *Row) void {
         const cells = row.cells.ptr(self.memory)[0..self.size.cols];
         for (cells) |c| if (c.hyperlink) return;
         row.hyperlink = false;
@@ -1183,7 +1197,7 @@ pub const Page = struct {
         };
         errdefer self.string_alloc.free(
             self.memory,
-            page_uri.offset.ptr(self.memory)[0..page_uri.len],
+            page_uri.slice(self.memory),
         );
 
         // Allocate an ID for our page memory if we have to.
@@ -1213,7 +1227,7 @@ pub const Page = struct {
             .implicit => {},
             .explicit => |slice| self.string_alloc.free(
                 self.memory,
-                slice.offset.ptr(self.memory)[0..slice.len],
+                slice.slice(self.memory),
             ),
         };
 
@@ -1246,7 +1260,7 @@ pub const Page = struct {
     /// Caller is responsible for updating the refcount in the hyperlink
     /// set as necessary by calling `use` if the id was not acquired with
     /// `add`.
-    pub fn setHyperlink(self: *Page, row: *Row, cell: *Cell, id: hyperlink.Id) error{HyperlinkMapOutOfMemory}!void {
+    pub inline fn setHyperlink(self: *Page, row: *Row, cell: *Cell, id: hyperlink.Id) error{HyperlinkMapOutOfMemory}!void {
         defer self.assertIntegrity();
 
         const cell_offset = getOffset(Cell, self.memory, cell);
@@ -1288,7 +1302,7 @@ pub const Page = struct {
     /// Move the hyperlink from one cell to another. This can't fail
     /// because we avoid any allocations since we're just moving data.
     /// Destination must NOT have a hyperlink.
-    fn moveHyperlink(self: *Page, src: *Cell, dst: *Cell) void {
+    inline fn moveHyperlink(self: *Page, src: *Cell, dst: *Cell) void {
         assert(src.hyperlink);
         assert(!dst.hyperlink);
 
@@ -1308,19 +1322,24 @@ pub const Page = struct {
 
     /// Returns the number of hyperlinks in the page. This isn't the byte
     /// size but the total number of unique cells that have hyperlink data.
-    pub fn hyperlinkCount(self: *const Page) usize {
+    pub inline fn hyperlinkCount(self: *const Page) usize {
         return self.hyperlink_map.map(self.memory).count();
     }
 
     /// Returns the hyperlink capacity for the page. This isn't the byte
     /// size but the number of unique cells that can have hyperlink data.
-    pub fn hyperlinkCapacity(self: *const Page) usize {
+    pub inline fn hyperlinkCapacity(self: *const Page) usize {
         return self.hyperlink_map.map(self.memory).capacity();
     }
 
     /// Set the graphemes for the given cell. This asserts that the cell
     /// has no graphemes set, and only contains a single codepoint.
-    pub fn setGraphemes(self: *Page, row: *Row, cell: *Cell, cps: []u21) GraphemeError!void {
+    pub inline fn setGraphemes(
+        self: *Page,
+        row: *Row,
+        cell: *Cell,
+        cps: []const u21,
+    ) GraphemeError!void {
         defer self.assertIntegrity();
 
         assert(cell.codepoint() > 0);
@@ -1357,7 +1376,7 @@ pub const Page = struct {
     pub fn appendGrapheme(self: *Page, row: *Row, cell: *Cell, cp: u21) Allocator.Error!void {
         defer self.assertIntegrity();
 
-        if (build_config.slow_runtime_safety) assert(cell.codepoint() != 0);
+        if (build_options.slow_runtime_safety) assert(cell.codepoint() != 0);
 
         const cell_offset = getOffset(Cell, self.memory, cell);
         var map = self.grapheme_map.map(self.memory);
@@ -1401,7 +1420,7 @@ pub const Page = struct {
         // most graphemes to fit within our chunk size.
         const cps = try self.grapheme_alloc.alloc(u21, self.memory, slice.len + 1);
         errdefer self.grapheme_alloc.free(self.memory, cps);
-        const old_cps = slice.offset.ptr(self.memory)[0..slice.len];
+        const old_cps = slice.slice(self.memory);
         fastmem.copy(u21, cps[0..old_cps.len], old_cps);
         cps[slice.len] = cp;
         slice.* = .{
@@ -1416,11 +1435,11 @@ pub const Page = struct {
     /// Returns the codepoints for the given cell. These are the codepoints
     /// in addition to the first codepoint. The first codepoint is NOT
     /// included since it is on the cell itself.
-    pub fn lookupGrapheme(self: *const Page, cell: *const Cell) ?[]u21 {
+    pub inline fn lookupGrapheme(self: *const Page, cell: *const Cell) ?[]u21 {
         const cell_offset = getOffset(Cell, self.memory, cell);
         const map = self.grapheme_map.map(self.memory);
         const slice = map.get(cell_offset) orelse return null;
-        return slice.offset.ptr(self.memory)[0..slice.len];
+        return slice.slice(self.memory);
     }
 
     /// Move the graphemes from one cell to another. This can't fail
@@ -1429,8 +1448,8 @@ pub const Page = struct {
     /// WARNING: This will NOT change the content_tag on the cells because
     /// there are scenarios where we want to move graphemes without changing
     /// the content tag. Callers beware but assertIntegrity should catch this.
-    fn moveGrapheme(self: *Page, src: *Cell, dst: *Cell) void {
-        if (build_config.slow_runtime_safety) {
+    inline fn moveGrapheme(self: *Page, src: *Cell, dst: *Cell) void {
+        if (build_options.slow_runtime_safety) {
             assert(src.hasGrapheme());
             assert(!dst.hasGrapheme());
         }
@@ -1445,9 +1464,13 @@ pub const Page = struct {
     }
 
     /// Clear the graphemes for a given cell.
-    pub fn clearGrapheme(self: *Page, row: *Row, cell: *Cell) void {
+    ///
+    /// In order to update the grapheme flag on the row, call
+    /// `updateRowGraphemeFlag` after you finish clearing any
+    /// graphemes in the row.
+    pub fn clearGrapheme(self: *Page, cell: *Cell) void {
         defer self.assertIntegrity();
-        if (build_config.slow_runtime_safety) assert(cell.hasGrapheme());
+        if (build_options.slow_runtime_safety) assert(cell.hasGrapheme());
 
         // Get our entry in the map, which must exist
         const cell_offset = getOffset(Cell, self.memory, cell);
@@ -1455,15 +1478,21 @@ pub const Page = struct {
         const entry = map.getEntry(cell_offset).?;
 
         // Free our grapheme data
-        const cps = entry.value_ptr.offset.ptr(self.memory)[0..entry.value_ptr.len];
+        const cps = entry.value_ptr.slice(self.memory);
         self.grapheme_alloc.free(self.memory, cps);
 
         // Remove the entry
         map.removeByPtr(entry.key_ptr);
 
-        // Mark that we no longer have graphemes, also search the row
-        // to make sure its state is correct.
+        // Mark that we no longer have graphemes by changing the content tag.
         cell.content_tag = .codepoint;
+    }
+
+    /// Checks if the row contains any graphemes and sets
+    /// the grapheme flag to false if none are found.
+    ///
+    /// Call after removing graphemes in a row.
+    pub inline fn updateRowGraphemeFlag(self: *Page, row: *Row) void {
         const cells = row.cells.ptr(self.memory)[0..self.size.cols];
         for (cells) |c| if (c.hasGrapheme()) return;
         row.grapheme = false;
@@ -1471,213 +1500,33 @@ pub const Page = struct {
 
     /// Returns the number of graphemes in the page. This isn't the byte
     /// size but the total number of unique cells that have grapheme data.
-    pub fn graphemeCount(self: *const Page) usize {
+    pub inline fn graphemeCount(self: *const Page) usize {
         return self.grapheme_map.map(self.memory).count();
     }
 
     /// Returns the grapheme capacity for the page. This isn't the byte
     /// size but the number of unique cells that can have grapheme data.
-    pub fn graphemeCapacity(self: *const Page) usize {
+    pub inline fn graphemeCapacity(self: *const Page) usize {
         return self.grapheme_map.map(self.memory).capacity();
     }
 
-    /// Options for encoding the page as UTF-8.
-    pub const EncodeUtf8Options = struct {
-        /// The range of rows to encode. If end_y is null, then it will
-        /// encode to the end of the page.
-        start_y: size.CellCountInt = 0,
-        end_y: ?size.CellCountInt = null,
-
-        /// If true, this will unwrap soft-wrapped lines. If false, this will
-        /// dump the screen as it is visually seen in a rendered window.
-        unwrap: bool = true,
-
-        /// Preceding state from encoding the prior page. Used to preserve
-        /// blanks properly across multiple pages.
-        preceding: TrailingUtf8State = .{},
-
-        /// If non-null, this will be cleared and filled with the x/y
-        /// coordinates of each byte in the UTF-8 encoded output.
-        /// The index in the array is the byte offset in the output
-        /// where 0 is the cursor of the writer when the function is
-        /// called.
-        cell_map: ?*CellMap = null,
-
-        /// Trailing state for UTF-8 encoding.
-        pub const TrailingUtf8State = struct {
-            rows: usize = 0,
-            cells: usize = 0,
-        };
-    };
-
-    /// See cell_map
-    pub const CellMap = std.ArrayList(CellMapEntry);
-
-    /// The x/y coordinate of a single cell in the cell map.
-    pub const CellMapEntry = struct {
-        y: size.CellCountInt,
-        x: size.CellCountInt,
-    };
-
-    /// Encode the page contents as UTF-8.
+    /// Checks if the row contains any styles and sets
+    /// the styled flag to false if none are found.
     ///
-    /// If preceding is non-null, then it will be used to initialize our
-    /// blank rows/cells count so that we can accumulate blanks across
-    /// multiple pages.
-    ///
-    /// Note: Many tests for this function are done via Screen.dumpString
-    /// tests since that function is a thin wrapper around this one and
-    /// it makes it easier to test input contents.
-    pub fn encodeUtf8(
-        self: *const Page,
-        writer: anytype,
-        opts: EncodeUtf8Options,
-    ) anyerror!EncodeUtf8Options.TrailingUtf8State {
-        var blank_rows: usize = opts.preceding.rows;
-        var blank_cells: usize = opts.preceding.cells;
+    /// Call after removing styles in a row.
+    pub inline fn updateRowStyledFlag(self: *Page, row: *Row) void {
+        const cells = row.cells.ptr(self.memory)[0..self.size.cols];
+        for (cells) |c| if (c.hasStyling()) return;
+        row.styled = false;
+    }
 
-        const start_y: size.CellCountInt = opts.start_y;
-        const end_y: size.CellCountInt = opts.end_y orelse self.size.rows;
-
-        // We can probably avoid this by doing the logic below in a different
-        // way. The reason this exists is so that when we end a non-blank
-        // line with a newline, we can correctly map the cell map over to
-        // the correct x value.
-        //
-        // For example "A\nB". The cell map for "\n" should be (1, 0).
-        // This is tested in Screen.zig so feel free to refactor this.
-        var last_x: size.CellCountInt = 0;
-
-        for (start_y..end_y) |y_usize| {
-            const y: size.CellCountInt = @intCast(y_usize);
-            const row: *Row = self.getRow(y);
-            const cells: []const Cell = self.getCells(row);
-
-            // If this row is blank, accumulate to avoid a bunch of extra
-            // work later. If it isn't blank, make sure we dump all our
-            // blanks.
-            if (!Cell.hasTextAny(cells)) {
-                blank_rows += 1;
-                continue;
-            }
-            for (1..blank_rows + 1) |i| {
-                try writer.writeByte('\n');
-
-                // This is tested in Screen.zig, i.e. one test is
-                // "cell map with newlines"
-                if (opts.cell_map) |cell_map| {
-                    try cell_map.append(.{
-                        .x = last_x,
-                        .y = @intCast(y - blank_rows + i - 1),
-                    });
-                    last_x = 0;
-                }
-            }
-            blank_rows = 0;
-
-            // If we're not wrapped, we always add a newline so after
-            // the row is printed we can add a newline.
-            if (!row.wrap or !opts.unwrap) blank_rows += 1;
-
-            // If the row doesn't continue a wrap then we need to reset
-            // our blank cell count.
-            if (!row.wrap_continuation or !opts.unwrap) blank_cells = 0;
-
-            // Go through each cell and print it
-            for (cells, 0..) |*cell, x_usize| {
-                const x: size.CellCountInt = @intCast(x_usize);
-
-                // Skip spacers
-                switch (cell.wide) {
-                    .narrow, .wide => {},
-                    .spacer_head, .spacer_tail => continue,
-                }
-
-                // If we have a zero value, then we accumulate a counter. We
-                // only want to turn zero values into spaces if we have a non-zero
-                // char sometime later.
-                if (!cell.hasText()) {
-                    blank_cells += 1;
-                    continue;
-                }
-                if (blank_cells > 0) {
-                    try writer.writeByteNTimes(' ', blank_cells);
-                    if (opts.cell_map) |cell_map| {
-                        for (0..blank_cells) |i| try cell_map.append(.{
-                            .x = @intCast(x - blank_cells + i),
-                            .y = y,
-                        });
-                    }
-
-                    blank_cells = 0;
-                }
-
-                switch (cell.content_tag) {
-                    .codepoint => {
-                        try writer.print("{u}", .{cell.content.codepoint});
-                        if (opts.cell_map) |cell_map| {
-                            last_x = x + 1;
-                            try cell_map.append(.{
-                                .x = x,
-                                .y = y,
-                            });
-                        }
-                    },
-
-                    .codepoint_grapheme => {
-                        try writer.print("{u}", .{cell.content.codepoint});
-                        if (opts.cell_map) |cell_map| {
-                            last_x = x + 1;
-                            try cell_map.append(.{
-                                .x = x,
-                                .y = y,
-                            });
-                        }
-
-                        for (self.lookupGrapheme(cell).?) |cp| {
-                            try writer.print("{u}", .{cp});
-                            if (opts.cell_map) |cell_map| try cell_map.append(.{
-                                .x = x,
-                                .y = y,
-                            });
-                        }
-                    },
-
-                    // Unreachable since we do hasText() above
-                    .bg_color_palette,
-                    .bg_color_rgb,
-                    => unreachable,
-                }
-            }
+    /// Returns true if this page is dirty at all.
+    pub inline fn isDirty(self: *const Page) bool {
+        if (self.dirty) return true;
+        for (self.rows.ptr(self.memory)[0..self.size.rows]) |row| {
+            if (row.dirty) return true;
         }
-
-        return .{ .rows = blank_rows, .cells = blank_cells };
-    }
-
-    /// Returns the bitset for the dirty bits on this page.
-    ///
-    /// The returned value is a DynamicBitSetUnmanaged but it is NOT
-    /// actually dynamic; do NOT call resize on this. It is safe to
-    /// read and write but do not resize it.
-    pub fn dirtyBitSet(self: *const Page) std.DynamicBitSetUnmanaged {
-        return .{
-            .bit_length = self.capacity.rows,
-            .masks = self.dirty.ptr(self.memory),
-        };
-    }
-
-    /// Returns true if the given row is dirty. This is NOT very
-    /// efficient if you're checking many rows and you should use
-    /// dirtyBitSet directly instead.
-    pub fn isRowDirty(self: *const Page, y: usize) bool {
-        return self.dirtyBitSet().isSet(y);
-    }
-
-    /// Returns true if this page is dirty at all. If you plan on
-    /// checking any additional rows, you should use dirtyBitSet and
-    /// check this on your own so you have the set available.
-    pub fn isDirty(self: *const Page) bool {
-        return self.dirtyBitSet().findFirstSet() != null;
+        return false;
     }
 
     pub const Layout = struct {
@@ -1686,10 +1535,8 @@ pub const Page = struct {
         rows_size: usize,
         cells_start: usize,
         cells_size: usize,
-        dirty_start: usize,
-        dirty_size: usize,
         styles_start: usize,
-        styles_layout: style.Set.Layout,
+        styles_layout: StyleSet.Layout,
         grapheme_alloc_start: usize,
         grapheme_alloc_layout: GraphemeAlloc.Layout,
         grapheme_map_start: usize,
@@ -1705,46 +1552,38 @@ pub const Page = struct {
 
     /// The memory layout for a page given a desired minimum cols
     /// and rows size.
-    pub fn layout(cap: Capacity) Layout {
+    pub inline fn layout(cap: Capacity) Layout {
         const rows_count: usize = @intCast(cap.rows);
         const rows_start = 0;
         const rows_end: usize = rows_start + (rows_count * @sizeOf(Row));
 
-        const cells_count: usize = @intCast(cap.cols * cap.rows);
+        const cells_count: usize = @as(usize, cap.cols) * @as(usize, cap.rows);
         const cells_start = alignForward(usize, rows_end, @alignOf(Cell));
         const cells_end = cells_start + (cells_count * @sizeOf(Cell));
 
-        // The division below cannot fail because our row count cannot
-        // exceed the maximum value of usize.
-        const dirty_bit_length: usize = rows_count;
-        const dirty_usize_length: usize = std.math.divCeil(
-            usize,
-            dirty_bit_length,
-            @bitSizeOf(usize),
-        ) catch unreachable;
-        const dirty_start = alignForward(usize, cells_end, @alignOf(usize));
-        const dirty_end: usize = dirty_start + (dirty_usize_length * @sizeOf(usize));
-
-        const styles_layout = style.Set.layout(cap.styles);
-        const styles_start = alignForward(usize, dirty_end, style.Set.base_align);
+        const styles_layout: StyleSet.Layout = .init(cap.styles);
+        const styles_start = alignForward(usize, cells_end, StyleSet.base_align.toByteUnits());
         const styles_end = styles_start + styles_layout.total_size;
 
         const grapheme_alloc_layout = GraphemeAlloc.layout(cap.grapheme_bytes);
-        const grapheme_alloc_start = alignForward(usize, styles_end, GraphemeAlloc.base_align);
+        const grapheme_alloc_start = alignForward(usize, styles_end, GraphemeAlloc.base_align.toByteUnits());
         const grapheme_alloc_end = grapheme_alloc_start + grapheme_alloc_layout.total_size;
 
-        const grapheme_count = @divFloor(cap.grapheme_bytes, grapheme_chunk);
+        const grapheme_count = std.math.ceilPowerOfTwo(
+            usize,
+            @divFloor(cap.grapheme_bytes, grapheme_chunk),
+        ) catch unreachable;
         const grapheme_map_layout = GraphemeMap.layout(@intCast(grapheme_count));
-        const grapheme_map_start = alignForward(usize, grapheme_alloc_end, GraphemeMap.base_align);
+        const grapheme_map_start = alignForward(usize, grapheme_alloc_end, GraphemeMap.base_align.toByteUnits());
         const grapheme_map_end = grapheme_map_start + grapheme_map_layout.total_size;
 
         const string_layout = StringAlloc.layout(cap.string_bytes);
-        const string_start = alignForward(usize, grapheme_map_end, StringAlloc.base_align);
+        const string_start = alignForward(usize, grapheme_map_end, StringAlloc.base_align.toByteUnits());
         const string_end = string_start + string_layout.total_size;
 
         const hyperlink_count = @divFloor(cap.hyperlink_bytes, @sizeOf(hyperlink.Set.Item));
-        const hyperlink_set_layout = hyperlink.Set.layout(@intCast(hyperlink_count));
-        const hyperlink_set_start = alignForward(usize, string_end, hyperlink.Set.base_align);
+        const hyperlink_set_layout: hyperlink.Set.Layout = .init(@intCast(hyperlink_count));
+        const hyperlink_set_start = alignForward(usize, string_end, hyperlink.Set.base_align.toByteUnits());
         const hyperlink_set_end = hyperlink_set_start + hyperlink_set_layout.total_size;
 
         const hyperlink_map_count: u32 = count: {
@@ -1756,10 +1595,10 @@ pub const Page = struct {
             break :count std.math.ceilPowerOfTwoAssert(u32, mult);
         };
         const hyperlink_map_layout = hyperlink.Map.layout(hyperlink_map_count);
-        const hyperlink_map_start = alignForward(usize, hyperlink_set_end, hyperlink.Map.base_align);
+        const hyperlink_map_start = alignForward(usize, hyperlink_set_end, hyperlink.Map.base_align.toByteUnits());
         const hyperlink_map_end = hyperlink_map_start + hyperlink_map_layout.total_size;
 
-        const total_size = alignForward(usize, hyperlink_map_end, std.mem.page_size);
+        const total_size = alignForward(usize, hyperlink_map_end, std.heap.page_size_min);
 
         return .{
             .total_size = total_size,
@@ -1767,8 +1606,6 @@ pub const Page = struct {
             .rows_size = rows_end - rows_start,
             .cells_start = cells_start,
             .cells_size = cells_end - cells_start,
-            .dirty_start = dirty_start,
-            .dirty_size = dirty_end - dirty_start,
             .styles_start = styles_start,
             .styles_layout = styles_layout,
             .grapheme_alloc_start = grapheme_alloc_start,
@@ -1805,69 +1642,74 @@ pub const Size = struct {
 };
 
 /// Capacity of this page.
+///
+/// This capacity can be maxed out (every field max) and still fit
+/// within a 64-bit memory space. If you need more than this, you will
+/// need to split data across separate pages.
+///
+/// For 32-bit systems, it is possible to overflow the addressable
+/// space and this is something we still need to address in the future
+/// likely by limiting the maximum capacity on 32-bit systems further.
 pub const Capacity = struct {
     /// Number of columns and rows we can know about.
     cols: size.CellCountInt,
     rows: size.CellCountInt,
 
     /// Number of unique styles that can be used on this page.
-    styles: usize = 16,
+    styles: size.StyleCountInt = 16,
 
     /// Number of bytes to allocate for hyperlink data. Note that the
     /// amount of data used for hyperlinks in total is more than this because
     /// hyperlinks use string data as well as a small amount of lookup metadata.
     /// This number is a rough approximation.
-    hyperlink_bytes: usize = hyperlink_bytes_default,
+    hyperlink_bytes: size.HyperlinkCountInt = hyperlink_bytes_default,
 
     /// Number of bytes to allocate for grapheme data.
-    grapheme_bytes: usize = grapheme_bytes_default,
+    grapheme_bytes: size.GraphemeBytesInt = grapheme_bytes_default,
 
     /// Number of bytes to allocate for strings.
-    string_bytes: usize = string_bytes_default,
+    string_bytes: size.StringBytesInt = string_bytes_default,
 
     pub const Adjustment = struct {
         cols: ?size.CellCountInt = null,
     };
 
+    /// Returns the maximum number of columns that can be used with this
+    /// capacity while still fitting at least one row. Returns null if even
+    /// a single column cannot fit (which would indicate an unusable capacity).
+    ///
+    /// Note that this is the maximum number of columns that never increases
+    /// the amount of memory the original capacity will take. If you modify
+    /// the original capacity to add rows, then you can fit more columns.
+    pub fn maxCols(self: Capacity) ?size.CellCountInt {
+        const available_bits = self.availableBitsForGrid();
+
+        // If we can't even fit the row metadata, return null
+        if (available_bits <= @bitSizeOf(Row)) return null;
+
+        // We do the math of how many columns we can fit in the remaining
+        // bits ignoring the metadata of a row.
+        const remaining_bits = available_bits - @bitSizeOf(Row);
+        const max_cols = remaining_bits / @bitSizeOf(Cell);
+
+        // Clamp to CellCountInt max
+        return @min(std.math.maxInt(size.CellCountInt), max_cols);
+    }
+
     /// Adjust the capacity parameters while retaining the same total size.
+    ///
     /// Adjustments always happen by limiting the rows in the page. Everything
     /// else can grow. If it is impossible to achieve the desired adjustment,
     /// OutOfMemory is returned.
     pub fn adjust(self: Capacity, req: Adjustment) Allocator.Error!Capacity {
         var adjusted = self;
         if (req.cols) |cols| {
-            // The math below only works if there is no alignment gap between
-            // the end of the rows array and the start of the cells array.
-            //
-            // To guarantee this, we assert that Row's size is a multiple of
-            // Cell's alignment, so that any length array of Rows will end on
-            // a valid alignment for the start of the Cell array.
-            assert(@sizeOf(Row) % @alignOf(Cell) == 0);
-
-            const layout = Page.layout(self);
-
-            // In order to determine the amount of space in the page available
-            // for rows & cells (which will allow us to calculate the number of
-            // rows we can fit at a certain column width) we need to layout the
-            // "meta" members of the page (i.e. everything else) from the end.
-            const hyperlink_map_start = alignBackward(usize, layout.total_size - layout.hyperlink_map_layout.total_size, hyperlink.Map.base_align);
-            const hyperlink_set_start = alignBackward(usize, hyperlink_map_start - layout.hyperlink_set_layout.total_size, hyperlink.Set.base_align);
-            const string_alloc_start = alignBackward(usize, hyperlink_set_start - layout.string_alloc_layout.total_size, StringAlloc.base_align);
-            const grapheme_map_start = alignBackward(usize, string_alloc_start - layout.grapheme_map_layout.total_size, GraphemeMap.base_align);
-            const grapheme_alloc_start = alignBackward(usize, grapheme_map_start - layout.grapheme_alloc_layout.total_size, GraphemeAlloc.base_align);
-            const styles_start = alignBackward(usize, grapheme_alloc_start - layout.styles_layout.total_size, style.Set.base_align);
+            const available_bits = self.availableBitsForGrid();
 
             // The size per row is:
             //   - The row metadata itself
             //   - The cells per row (n=cols)
-            //   - 1 bit for dirty tracking
-            const bits_per_row: usize = size: {
-                var bits: usize = @bitSizeOf(Row); // Row metadata
-                bits += @bitSizeOf(Cell) * @as(usize, @intCast(cols)); // Cells (n=cols)
-                bits += 1; // The dirty bit
-                break :size bits;
-            };
-            const available_bits: usize = styles_start * 8;
+            const bits_per_row: usize = @bitSizeOf(Row) + @bitSizeOf(Cell) * @as(usize, @intCast(cols));
             const new_rows: usize = @divFloor(available_bits, bits_per_row);
 
             // If our rows go to zero then we can't fit any row metadata
@@ -1879,6 +1721,34 @@ pub const Capacity = struct {
         }
 
         return adjusted;
+    }
+
+    /// Computes the number of bits available for rows and cells in the page.
+    ///
+    /// This is done by laying out the "meta" members (styles, graphemes,
+    /// hyperlinks, strings) from the end of the page and finding where they
+    /// start, which gives us the space available for rows and cells.
+    fn availableBitsForGrid(self: Capacity) usize {
+        // The math below only works if there is no alignment gap between
+        // the end of the rows array and the start of the cells array.
+        //
+        // To guarantee this, we assert that Row's size is a multiple of
+        // Cell's alignment, so that any length array of Rows will end on
+        // a valid alignment for the start of the Cell array.
+        assert(@sizeOf(Row) % @alignOf(Cell) == 0);
+
+        const l = Page.layout(self);
+
+        // Layout meta members from the end to find styles_start
+        const hyperlink_map_start = alignBackward(usize, l.total_size - l.hyperlink_map_layout.total_size, hyperlink.Map.base_align.toByteUnits());
+        const hyperlink_set_start = alignBackward(usize, hyperlink_map_start - l.hyperlink_set_layout.total_size, hyperlink.Set.base_align.toByteUnits());
+        const string_alloc_start = alignBackward(usize, hyperlink_set_start - l.string_alloc_layout.total_size, StringAlloc.base_align.toByteUnits());
+        const grapheme_map_start = alignBackward(usize, string_alloc_start - l.grapheme_map_layout.total_size, GraphemeMap.base_align.toByteUnits());
+        const grapheme_alloc_start = alignBackward(usize, grapheme_map_start - l.grapheme_alloc_layout.total_size, GraphemeAlloc.base_align.toByteUnits());
+        const styles_start = alignBackward(usize, grapheme_alloc_start - l.styles_layout.total_size, StyleSet.base_align.toByteUnits());
+
+        // Multiply by 8 to convert bytes to bits
+        return styles_start * 8;
     }
 };
 
@@ -1923,9 +1793,25 @@ pub const Row = packed struct(u64) {
 
     /// True if this row contains a virtual placeholder for the Kitty
     /// graphics protocol. (U+10EEEE)
+    // Note: We keep this as memory-using even if the kitty graphics
+    // feature is disabled because we want to keep our padding and
+    // everything throughout the same.
     kitty_virtual_placeholder: bool = false,
 
-    _padding: u23 = 0,
+    /// True if this row is dirty and requires a redraw. This is set to true
+    /// by any operation that modifies the row's contents or position, and
+    /// consumers of the page are expected to clear it when they redraw.
+    ///
+    /// Dirty status is only ever meant to convey that one or more cells in
+    /// the row have changed visually. A cell which changes in a way that
+    /// doesn't affect the visual representation may not be marked as dirty.
+    ///
+    /// Dirty tracking may have false positives but should never have false
+    /// negatives. A false negative would result in a visual artifact on the
+    /// screen.
+    dirty: bool = false,
+
+    _padding: u22 = 0,
 
     /// Semantic prompt type.
     pub const SemanticPrompt = enum(u3) {
@@ -1952,8 +1838,9 @@ pub const Row = packed struct(u64) {
 
     /// Returns true if this row has any managed memory outside of the
     /// row structure (graphemes, styles, etc.)
-    fn managedMemory(self: Row) bool {
-        return self.grapheme or self.styled or self.hyperlink;
+    pub inline fn managedMemory(self: Row) bool {
+        // Ordered on purpose for likelihood.
+        return self.styled or self.hyperlink or self.grapheme;
     }
 };
 
@@ -1980,7 +1867,7 @@ pub const Cell = packed struct(u64) {
 
     /// The style ID to use for this cell within the style map. Zero
     /// is always the default style so no lookup is required.
-    style_id: style.Id = 0,
+    style_id: StyleId = 0,
 
     /// The wide property of this cell, for wide characters. Characters in
     /// a terminal grid can only be 1 or 2 cells wide. A wide character
@@ -2037,13 +1924,16 @@ pub const Cell = packed struct(u64) {
 
     /// Helper to make a cell that just has a codepoint.
     pub fn init(cp: u21) Cell {
-        return .{
-            .content_tag = .codepoint,
-            .content = .{ .codepoint = cp },
-        };
+        // We have to use this bitCast here to ensure that our memory is
+        // zeroed. Otherwise, the content below will leave some uninitialized
+        // memory in the packed union. Valgrind verifies this.
+        var cell: Cell = @bitCast(@as(u64, 0));
+        cell.content_tag = .codepoint;
+        cell.content = .{ .codepoint = cp };
+        return cell;
     }
 
-    pub fn isZero(self: Cell) bool {
+    pub inline fn isZero(self: Cell) bool {
         return @as(u64, @bitCast(self)) == 0;
     }
 
@@ -2053,7 +1943,7 @@ pub const Cell = packed struct(u64) {
     ///   - Cell text is blank
     ///   - Cell is styled but only with a background color and no text
     ///   - Cell has a unicode placeholder for Kitty graphics protocol
-    pub fn hasText(self: Cell) bool {
+    pub inline fn hasText(self: Cell) bool {
         return switch (self.content_tag) {
             .codepoint,
             .codepoint_grapheme,
@@ -2065,7 +1955,7 @@ pub const Cell = packed struct(u64) {
         };
     }
 
-    pub fn codepoint(self: Cell) u21 {
+    pub inline fn codepoint(self: Cell) u21 {
         return switch (self.content_tag) {
             .codepoint,
             .codepoint_grapheme,
@@ -2078,15 +1968,15 @@ pub const Cell = packed struct(u64) {
     }
 
     /// The width in grid cells that this cell takes up.
-    pub fn gridWidth(self: Cell) u2 {
+    pub inline fn gridWidth(self: Cell) u2 {
         return switch (self.wide) {
             .narrow, .spacer_head, .spacer_tail => 1,
             .wide => 2,
         };
     }
 
-    pub fn hasStyling(self: Cell) bool {
-        return self.style_id != style.default_id;
+    pub inline fn hasStyling(self: Cell) bool {
+        return self.style_id != stylepkg.default_id;
     }
 
     /// Returns true if the cell has no text or styling.
@@ -2104,12 +1994,12 @@ pub const Cell = packed struct(u64) {
         };
     }
 
-    pub fn hasGrapheme(self: Cell) bool {
+    pub inline fn hasGrapheme(self: Cell) bool {
         return self.content_tag == .codepoint_grapheme;
     }
 
     /// Returns true if the set of cells has text in it.
-    pub fn hasTextAny(cells: []const Cell) bool {
+    pub inline fn hasTextAny(cells: []const Cell) bool {
         for (cells) |cell| {
             if (cell.hasText()) return true;
         }
@@ -2128,12 +2018,12 @@ pub const Cell = packed struct(u64) {
 //             .styles = 128,
 //             .grapheme_bytes = 1024,
 //         }).total_size,
-//         std.mem.page_size,
+//         std.heap.page_size_min,
 //     );
 //
 //     std.log.warn("total_size={} pages={}", .{
 //         total_size,
-//         total_size / std.mem.page_size,
+//         total_size / std.heap.page_size_min,
 //     });
 // }
 //
@@ -2143,8 +2033,23 @@ pub const Cell = packed struct(u64) {
 //     // so we fail a test if it changes.
 //     const total_size = Page.layout(std_capacity).total_size;
 //     try testing.expectEqual(@as(usize, 524_288), total_size); // 512 KiB
-//     //const pages = total_size / std.mem.page_size;
+//     //const pages = total_size / std.heap.page_size_min;
 // }
+
+test "Page.layout can take a maxed capacity" {
+    // Our intention is for a maxed-out capacity to always fit
+    // within a page layout without triggering runtime safety on any
+    // overflow. This simplifies some of our handling downstream of the
+    // call (relevant to: https://github.com/ghostty-org/ghostty/issues/10258)
+    var cap: Capacity = undefined;
+    inline for (@typeInfo(Capacity).@"struct".fields) |field| {
+        @field(cap, field.name) = std.math.maxInt(field.type);
+    }
+
+    // Note that a max capacity will exceed our max_page_size so we
+    // can't init a page with it, but it should layout.
+    _ = Page.layout(cap);
+}
 
 test "Cell is zero by default" {
     const cell = Cell.init(0);
@@ -2219,6 +2124,40 @@ test "Page capacity adjust cols too high" {
     );
 }
 
+test "Capacity maxCols basic" {
+    const cap = std_capacity;
+    const max = cap.maxCols().?;
+
+    // maxCols should be >= current cols (since current capacity is valid)
+    try testing.expect(max >= cap.cols);
+
+    // Adjusting to maxCols should succeed with at least 1 row
+    const adjusted = try cap.adjust(.{ .cols = max });
+    try testing.expect(adjusted.rows >= 1);
+
+    // Adjusting to maxCols + 1 should fail
+    try testing.expectError(
+        error.OutOfMemory,
+        cap.adjust(.{ .cols = max + 1 }),
+    );
+}
+
+test "Capacity maxCols preserves total size" {
+    const cap = std_capacity;
+    const original_size = Page.layout(cap).total_size;
+    const max = cap.maxCols().?;
+    const adjusted = try cap.adjust(.{ .cols = max });
+    const adjusted_size = Page.layout(adjusted).total_size;
+    try testing.expectEqual(original_size, adjusted_size);
+}
+
+test "Capacity maxCols with 1 row exactly" {
+    const cap = std_capacity;
+    const max = cap.maxCols().?;
+    const adjusted = try cap.adjust(.{ .cols = max });
+    try testing.expectEqual(@as(size.CellCountInt, 1), adjusted.rows);
+}
+
 test "Page init" {
     var page = try Page.init(.{
         .cols = 120,
@@ -2226,10 +2165,6 @@ test "Page init" {
         .styles = 32,
     });
     defer page.deinit();
-
-    // Dirty set should be empty
-    const dirty = page.dirtyBitSet();
-    try std.testing.expectEqual(@as(usize, 0), dirty.count());
 }
 
 test "Page read and write cells" {
@@ -2264,7 +2199,7 @@ test "Page appendGrapheme small" {
     defer page.deinit();
 
     const rac = page.getRowAndCell(0, 0);
-    rac.cell.* = Cell.init(0x09);
+    rac.cell.* = .init(0x09);
 
     // One
     try page.appendGrapheme(rac.row, rac.cell, 0x0A);
@@ -2279,7 +2214,8 @@ test "Page appendGrapheme small" {
     try testing.expectEqualSlices(u21, &.{ 0x0A, 0x0B }, page.lookupGrapheme(rac.cell).?);
 
     // Clear it
-    page.clearGrapheme(rac.row, rac.cell);
+    page.clearGrapheme(rac.cell);
+    page.updateRowGraphemeFlag(rac.row);
     try testing.expect(!rac.row.grapheme);
     try testing.expect(!rac.cell.hasGrapheme());
 }
@@ -2293,7 +2229,7 @@ test "Page appendGrapheme larger than chunk" {
     defer page.deinit();
 
     const rac = page.getRowAndCell(0, 0);
-    rac.cell.* = Cell.init(0x09);
+    rac.cell.* = .init(0x09);
 
     const count = grapheme_chunk_len * 10;
     for (0..count) |i| {
@@ -2316,15 +2252,16 @@ test "Page clearGrapheme not all cells" {
     defer page.deinit();
 
     const rac = page.getRowAndCell(0, 0);
-    rac.cell.* = Cell.init(0x09);
+    rac.cell.* = .init(0x09);
     try page.appendGrapheme(rac.row, rac.cell, 0x0A);
 
     const rac2 = page.getRowAndCell(1, 0);
-    rac2.cell.* = Cell.init(0x09);
+    rac2.cell.* = .init(0x09);
     try page.appendGrapheme(rac2.row, rac2.cell, 0x0A);
 
     // Clear it
-    page.clearGrapheme(rac.row, rac.cell);
+    page.clearGrapheme(rac.cell);
+    page.updateRowGraphemeFlag(rac.row);
     try testing.expect(rac.row.grapheme);
     try testing.expect(!rac.cell.hasGrapheme());
     try testing.expect(rac2.cell.hasGrapheme());
@@ -2377,6 +2314,84 @@ test "Page clone" {
     for (0..page.capacity.rows) |y| {
         const rac = page.getRowAndCell(1, y);
         try testing.expectEqual(@as(u21, 0), rac.cell.content.codepoint);
+    }
+}
+
+test "Page clone graphemes" {
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    // Append some graphemes
+    {
+        const rac = page.getRowAndCell(0, 0);
+        rac.cell.* = .init(0x09);
+        try page.appendGrapheme(rac.row, rac.cell, 0x0A);
+        try page.appendGrapheme(rac.row, rac.cell, 0x0B);
+    }
+
+    // Clone it
+    var page2 = try page.clone();
+    defer page2.deinit();
+    {
+        const rac = page2.getRowAndCell(0, 0);
+        try testing.expect(rac.row.grapheme);
+        try testing.expect(rac.cell.hasGrapheme());
+        try testing.expectEqualSlices(u21, &.{ 0x0A, 0x0B }, page2.lookupGrapheme(rac.cell).?);
+    }
+}
+
+test "Page clone styles" {
+    var page = try Page.init(.{
+        .cols = 10,
+        .rows = 10,
+        .styles = 8,
+    });
+    defer page.deinit();
+
+    // Write with some styles
+    {
+        const id = try page.styles.add(page.memory, .{ .flags = .{
+            .bold = true,
+        } });
+
+        for (0..page.size.cols) |x| {
+            const rac = page.getRowAndCell(x, 0);
+            rac.row.styled = true;
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = @intCast(x + 1) },
+                .style_id = id,
+            };
+            page.styles.use(page.memory, id);
+        }
+    }
+
+    // Clone it
+    var page2 = try page.clone();
+    defer page2.deinit();
+    {
+        const id: u16 = style: {
+            const rac = page2.getRowAndCell(0, 0);
+            break :style rac.cell.style_id;
+        };
+
+        for (0..page.size.cols) |x| {
+            const rac = page.getRowAndCell(x, 0);
+            try testing.expect(rac.row.styled);
+            try testing.expectEqual(id, rac.cell.style_id);
+        }
+
+        const style = page.styles.get(
+            page.memory,
+            id,
+        );
+        try testing.expect((Style{ .flags = .{
+            .bold = true,
+        } }).eql(style.*));
     }
 }
 
@@ -2588,7 +2603,8 @@ test "Page cloneFrom graphemes" {
     // Write again
     for (0..page.capacity.rows) |y| {
         const rac = page.getRowAndCell(1, y);
-        page.clearGrapheme(rac.row, rac.cell);
+        page.clearGrapheme(rac.cell);
+        page.updateRowGraphemeFlag(rac.row);
         rac.cell.* = .{
             .content_tag = .codepoint,
             .content = .{ .codepoint = 0 },
@@ -3033,6 +3049,10 @@ test "Page moveCells graphemes" {
 }
 
 test "Page verifyIntegrity graphemes good" {
+    // Too slow, and not really necessary because the integrity tests are
+    // only run in debug builds and unit tests verify they work well enough.
+    if (std.valgrind.runningOnValgrind() > 0) return error.SkipZigTest;
+
     var page = try Page.init(.{
         .cols = 10,
         .rows = 10,
@@ -3054,6 +3074,10 @@ test "Page verifyIntegrity graphemes good" {
 }
 
 test "Page verifyIntegrity grapheme row not marked" {
+    // Too slow, and not really necessary because the integrity tests are
+    // only run in debug builds and unit tests verify they work well enough.
+    if (std.valgrind.runningOnValgrind() > 0) return error.SkipZigTest;
+
     var page = try Page.init(.{
         .cols = 10,
         .rows = 10,
@@ -3081,6 +3105,10 @@ test "Page verifyIntegrity grapheme row not marked" {
 }
 
 test "Page verifyIntegrity styles good" {
+    // Too slow, and not really necessary because the integrity tests are
+    // only run in debug builds and unit tests verify they work well enough.
+    if (std.valgrind.runningOnValgrind() > 0) return error.SkipZigTest;
+
     var page = try Page.init(.{
         .cols = 10,
         .rows = 10,
@@ -3113,6 +3141,10 @@ test "Page verifyIntegrity styles good" {
 }
 
 test "Page verifyIntegrity styles ref count mismatch" {
+    // Too slow, and not really necessary because the integrity tests are
+    // only run in debug builds and unit tests verify they work well enough.
+    if (std.valgrind.runningOnValgrind() > 0) return error.SkipZigTest;
+
     var page = try Page.init(.{
         .cols = 10,
         .rows = 10,
@@ -3151,6 +3183,10 @@ test "Page verifyIntegrity styles ref count mismatch" {
 }
 
 test "Page verifyIntegrity zero rows" {
+    // Too slow, and not really necessary because the integrity tests are
+    // only run in debug builds and unit tests verify they work well enough.
+    if (std.valgrind.runningOnValgrind() > 0) return error.SkipZigTest;
+
     var page = try Page.init(.{
         .cols = 10,
         .rows = 10,
@@ -3165,6 +3201,10 @@ test "Page verifyIntegrity zero rows" {
 }
 
 test "Page verifyIntegrity zero cols" {
+    // Too slow, and not really necessary because the integrity tests are
+    // only run in debug builds and unit tests verify they work well enough.
+    if (std.valgrind.runningOnValgrind() > 0) return error.SkipZigTest;
+
     var page = try Page.init(.{
         .cols = 10,
         .rows = 10,

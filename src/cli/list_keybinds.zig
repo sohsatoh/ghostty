@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const args = @import("args.zig");
-const Action = @import("action.zig").Action;
+const Action = @import("ghostty.zig").Action;
 const Arena = std.heap.ArenaAllocator;
 const Allocator = std.mem.Allocator;
 const configpkg = @import("../config.zig");
@@ -64,38 +64,66 @@ pub fn run(alloc: Allocator) !u8 {
     var config = if (opts.default) try Config.default(alloc) else try Config.load(alloc);
     defer config.deinit();
 
-    const stdout = std.io.getStdOut();
+    var buffer: [1024]u8 = undefined;
+    const stdout: std.fs.File = .stdout();
+    var stdout_writer = stdout.writer(&buffer);
+    const writer = &stdout_writer.interface;
 
-    // Despite being under the posix namespace, this also works on Windows as of zig 0.13.0
-    if (tui.can_pretty_print and !opts.plain and std.posix.isatty(stdout.handle)) {
+    if (tui.can_pretty_print and !opts.plain and stdout.isTty()) {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         return prettyPrint(arena.allocator(), config.keybind);
     } else {
         try config.keybind.formatEntryDocs(
-            configpkg.entryFormatter("keybind", stdout.writer()),
+            configpkg.entryFormatter("keybind", writer),
             opts.docs,
         );
     }
 
+    // Don't forget to flush!
+    try writer.flush();
     return 0;
 }
 
-const TriggerList = std.SinglyLinkedList(Binding.Trigger);
+const TriggerNode = struct {
+    data: Binding.Trigger,
+    node: std.SinglyLinkedList.Node = .{},
+
+    pub fn get(node: *std.SinglyLinkedList.Node) *TriggerNode {
+        return @fieldParentPtr("node", node);
+    }
+};
 
 const ChordBinding = struct {
-    triggers: TriggerList,
-    action: Binding.Action,
+    table_name: ?[]const u8 = null,
+    triggers: std.SinglyLinkedList,
+    actions: []const Binding.Action,
 
     // Order keybinds based on various properties
-    //    1. Longest chord sequence
-    //    2. Most active modifiers
-    //    3. Alphabetically by active modifiers
-    //    4. Trigger key order
+    //    1. Default bindings before table bindings (tables grouped at end)
+    //    2. Longest chord sequence
+    //    3. Most active modifiers
+    //    4. Alphabetically by active modifiers
+    //    5. Trigger key order
+    //    6. Within tables, sort by table name
     // These properties propagate through chorded keypresses
     //
     // Adapted from Binding.lessThan
     pub fn lessThan(_: void, lhs: ChordBinding, rhs: ChordBinding) bool {
+        const lhs_has_table = lhs.table_name != null;
+        const rhs_has_table = rhs.table_name != null;
+
+        if (lhs_has_table != rhs_has_table) {
+            return !lhs_has_table;
+        }
+
+        if (lhs_has_table) {
+            const table_cmp = std.mem.order(u8, lhs.table_name.?, rhs.table_name.?);
+            if (table_cmp != .eq) {
+                return table_cmp == .lt;
+            }
+        }
+
         const lhs_len = lhs.triggers.len();
         const rhs_len = rhs.triggers.len();
 
@@ -109,7 +137,8 @@ const ChordBinding = struct {
         const lhs_count: usize = blk: {
             var count: usize = 0;
             var maybe_trigger = lhs.triggers.first;
-            while (maybe_trigger) |trigger| : (maybe_trigger = trigger.next) {
+            while (maybe_trigger) |node| : (maybe_trigger = node.next) {
+                const trigger: *TriggerNode = .get(node);
                 if (trigger.data.mods.super) count += 1;
                 if (trigger.data.mods.ctrl) count += 1;
                 if (trigger.data.mods.shift) count += 1;
@@ -120,7 +149,8 @@ const ChordBinding = struct {
         const rhs_count: usize = blk: {
             var count: usize = 0;
             var maybe_trigger = rhs.triggers.first;
-            while (maybe_trigger) |trigger| : (maybe_trigger = trigger.next) {
+            while (maybe_trigger) |node| : (maybe_trigger = node.next) {
+                const trigger: *TriggerNode = .get(node);
                 if (trigger.data.mods.super) count += 1;
                 if (trigger.data.mods.ctrl) count += 1;
                 if (trigger.data.mods.shift) count += 1;
@@ -137,8 +167,8 @@ const ChordBinding = struct {
             var l_trigger = lhs.triggers.first;
             var r_trigger = rhs.triggers.first;
             while (l_trigger != null and r_trigger != null) {
-                const l_int = l_trigger.?.data.mods.int();
-                const r_int = r_trigger.?.data.mods.int();
+                const l_int = TriggerNode.get(l_trigger.?).data.mods.int();
+                const r_int = TriggerNode.get(r_trigger.?).data.mods.int();
 
                 if (l_int != r_int) {
                     return l_int > r_int;
@@ -153,18 +183,19 @@ const ChordBinding = struct {
         var r_trigger = rhs.triggers.first;
 
         while (l_trigger != null and r_trigger != null) {
+            // We want catch_all to sort last.
             const lhs_key: c_int = blk: {
-                switch (l_trigger.?.data.key) {
-                    .translated => |key| break :blk @intFromEnum(key),
+                switch (TriggerNode.get(l_trigger.?).data.key) {
                     .physical => |key| break :blk @intFromEnum(key),
                     .unicode => |key| break :blk @intCast(key),
+                    .catch_all => break :blk std.math.maxInt(c_int),
                 }
             };
             const rhs_key: c_int = blk: {
-                switch (r_trigger.?.data.key) {
-                    .translated => |key| break :blk @intFromEnum(key),
+                switch (TriggerNode.get(r_trigger.?).data.key) {
                     .physical => |key| break :blk @intFromEnum(key),
                     .unicode => |key| break :blk @intCast(key),
+                    .catch_all => break :blk std.math.maxInt(c_int),
                 }
             };
 
@@ -188,19 +219,18 @@ const ChordBinding = struct {
 
 fn prettyPrint(alloc: Allocator, keybinds: Config.Keybinds) !u8 {
     // Set up vaxis
-    var tty = try vaxis.Tty.init();
+    var buf: [1024]u8 = undefined;
+    var tty = try vaxis.Tty.init(&buf);
     defer tty.deinit();
     var vx = try vaxis.init(alloc, .{});
-    defer vx.deinit(alloc, tty.anyWriter());
+    const writer = tty.writer();
+    defer vx.deinit(alloc, writer);
 
     // We know we are ghostty, so let's enable mode 2027. Vaxis normally does this but you need an
     // event loop to auto-enable it.
     vx.caps.unicode = .unicode;
-    try tty.anyWriter().writeAll(vaxis.ctlseqs.unicode_set);
-    defer tty.anyWriter().writeAll(vaxis.ctlseqs.unicode_reset) catch {};
-
-    var buf_writer = tty.bufferedWriter();
-    const writer = buf_writer.writer().any();
+    try writer.writeAll(vaxis.ctlseqs.unicode_set);
+    defer writer.writeAll(vaxis.ctlseqs.unicode_reset) catch {};
 
     const winsize: vaxis.Winsize = switch (builtin.os.tag) {
         // We use some default, it doesn't really matter for what
@@ -214,14 +244,34 @@ fn prettyPrint(alloc: Allocator, keybinds: Config.Keybinds) !u8 {
 
         else => try vaxis.Tty.getWinsize(tty.fd),
     };
-    try vx.resize(alloc, tty.anyWriter(), winsize);
+    try vx.resize(alloc, writer, winsize);
 
     const win = vx.window();
 
-    // Generate a list of bindings, recursively traversing chorded keybindings
+    // Collect default bindings, recursively flattening chords
     var iter = keybinds.set.bindings.iterator();
-    const bindings, const widest_chord = try iterateBindings(alloc, &iter, &win);
+    const default_bindings, var widest_chord = try iterateBindings(alloc, &iter, &win);
 
+    var bindings_list: std.ArrayList(ChordBinding) = .empty;
+    try bindings_list.appendSlice(alloc, default_bindings);
+
+    // Collect key table bindings
+    var widest_table_prefix: u16 = 0;
+    var table_iter = keybinds.tables.iterator();
+    while (table_iter.next()) |table_entry| {
+        const table_name = table_entry.key_ptr.*;
+        var binding_iter = table_entry.value_ptr.bindings.iterator();
+        const table_bindings, const table_width = try iterateBindings(alloc, &binding_iter, &win);
+        for (table_bindings) |*b| {
+            b.table_name = table_name;
+        }
+
+        try bindings_list.appendSlice(alloc, table_bindings);
+        widest_chord = @max(widest_chord, table_width);
+        widest_table_prefix = @max(widest_table_prefix, @as(u16, @intCast(win.gwidth(table_name) + win.gwidth("/"))));
+    }
+
+    const bindings = bindings_list.items;
     std.mem.sort(ChordBinding, bindings, {}, ChordBinding.lessThan);
 
     // Set up styles for each modifier
@@ -229,14 +279,26 @@ fn prettyPrint(alloc: Allocator, keybinds: Config.Keybinds) !u8 {
     const ctrl_style: vaxis.Style = .{ .fg = .{ .index = 2 } };
     const alt_style: vaxis.Style = .{ .fg = .{ .index = 3 } };
     const shift_style: vaxis.Style = .{ .fg = .{ .index = 4 } };
+    const table_style: vaxis.Style = .{ .fg = .{ .index = 8 } };
 
     // Print the list
     for (bindings) |bind| {
         win.clear();
 
         var result: vaxis.Window.PrintResult = .{ .col = 0, .row = 0, .overflow = false };
+
+        if (bind.table_name) |name| {
+            result = win.printSegment(
+                .{ .text = name, .style = table_style },
+                .{ .col_offset = result.col },
+            );
+            result = win.printSegment(.{ .text = "/", .style = table_style }, .{ .col_offset = result.col });
+        }
+
         var maybe_trigger = bind.triggers.first;
-        while (maybe_trigger) |trigger| : (maybe_trigger = trigger.next) {
+        while (maybe_trigger) |node| : (maybe_trigger = node.next) {
+            const trigger: *TriggerNode = .get(node);
+
             if (trigger.data.mods.super) {
                 result = win.printSegment(.{ .text = "super", .style = super_style }, .{ .col_offset = result.col });
                 result = win.printSegment(.{ .text = " + " }, .{ .col_offset = result.col });
@@ -254,88 +316,120 @@ fn prettyPrint(alloc: Allocator, keybinds: Config.Keybinds) !u8 {
                 result = win.printSegment(.{ .text = " + " }, .{ .col_offset = result.col });
             }
             const key = switch (trigger.data.key) {
-                .translated => |k| try std.fmt.allocPrint(alloc, "{s}", .{@tagName(k)}),
-                .physical => |k| try std.fmt.allocPrint(alloc, "physical:{s}", .{@tagName(k)}),
+                .physical => |k| try std.fmt.allocPrint(alloc, "{t}", .{k}),
                 .unicode => |c| try std.fmt.allocPrint(alloc, "{u}", .{c}),
+                .catch_all => "catch_all",
             };
             result = win.printSegment(.{ .text = key }, .{ .col_offset = result.col });
 
             // Print a separator between chorded keys
-            if (trigger.next != null) {
+            if (trigger.node.next != null) {
                 result = win.printSegment(.{ .text = "  >  ", .style = .{ .bold = true, .fg = .{ .index = 6 } } }, .{ .col_offset = result.col });
             }
         }
 
-        const action = try std.fmt.allocPrint(alloc, "{}", .{bind.action});
-        // If our action has an argument, we print the argument in a different color
-        if (std.mem.indexOfScalar(u8, action, ':')) |idx| {
-            _ = win.print(&.{
-                .{ .text = action[0..idx] },
-                .{ .text = action[idx .. idx + 1], .style = .{ .dim = true } },
-                .{ .text = action[idx + 1 ..], .style = .{ .fg = .{ .index = 5 } } },
-            }, .{ .col_offset = widest_chord + 3 });
-        } else {
-            _ = win.printSegment(.{ .text = action }, .{ .col_offset = widest_chord + 3 });
+        var action_col: u16 = widest_table_prefix + widest_chord + 3;
+        for (bind.actions, 0..) |act, i| {
+            if (i > 0) {
+                const chain_result = win.printSegment(
+                    .{ .text = ", ", .style = .{ .dim = true } },
+                    .{ .col_offset = action_col },
+                );
+                action_col = chain_result.col;
+            }
+
+            const action = try std.fmt.allocPrint(alloc, "{f}", .{act});
+            // If our action has an argument, we print the argument in a different color
+            if (std.mem.indexOfScalar(u8, action, ':')) |idx| {
+                const print_result = win.print(&.{
+                    .{ .text = action[0..idx] },
+                    .{ .text = action[idx .. idx + 1], .style = .{ .dim = true } },
+                    .{ .text = action[idx + 1 ..], .style = .{ .fg = .{ .index = 5 } } },
+                }, .{ .col_offset = action_col });
+                action_col = print_result.col;
+            } else {
+                const print_result = win.printSegment(
+                    .{ .text = action },
+                    .{ .col_offset = action_col },
+                );
+                action_col = print_result.col;
+            }
         }
         try vx.prettyPrint(writer);
     }
-    try buf_writer.flush();
+    try writer.flush();
     return 0;
 }
 
-fn iterateBindings(alloc: Allocator, iter: anytype, win: *const vaxis.Window) !struct { []ChordBinding, u16 } {
+fn iterateBindings(
+    alloc: Allocator,
+    iter: anytype,
+    win: *const vaxis.Window,
+) !struct { []ChordBinding, u16 } {
     var widest_chord: u16 = 0;
-    var bindings = std.ArrayList(ChordBinding).init(alloc);
+    var bindings: std.ArrayList(ChordBinding) = .empty;
     while (iter.next()) |bind| {
         const width = blk: {
-            var buf = std.ArrayList(u8).init(alloc);
+            var buf: std.Io.Writer.Allocating = .init(alloc);
             const t = bind.key_ptr.*;
 
-            if (t.mods.super) try std.fmt.format(buf.writer(), "super + ", .{});
-            if (t.mods.ctrl) try std.fmt.format(buf.writer(), "ctrl  + ", .{});
-            if (t.mods.alt) try std.fmt.format(buf.writer(), "alt   + ", .{});
-            if (t.mods.shift) try std.fmt.format(buf.writer(), "shift + ", .{});
+            if (t.mods.super) try buf.writer.print("super + ", .{});
+            if (t.mods.ctrl) try buf.writer.print("ctrl  + ", .{});
+            if (t.mods.alt) try buf.writer.print("alt   + ", .{});
+            if (t.mods.shift) try buf.writer.print("shift + ", .{});
 
             switch (t.key) {
-                .translated => |k| try std.fmt.format(buf.writer(), "{s}", .{@tagName(k)}),
-                .physical => |k| try std.fmt.format(buf.writer(), "physical:{s}", .{@tagName(k)}),
-                .unicode => |c| try std.fmt.format(buf.writer(), "{u}", .{c}),
+                .physical => |k| try buf.writer.print("{t}", .{k}),
+                .unicode => |c| try buf.writer.print("{u}", .{c}),
+                .catch_all => try buf.writer.print("catch_all", .{}),
             }
 
-            break :blk win.gwidth(buf.items);
+            break :blk win.gwidth(buf.written());
         };
 
         switch (bind.value_ptr.*) {
             .leader => |leader| {
-
                 // Recursively iterate on the set of bindings for this leader key
                 var n_iter = leader.bindings.iterator();
                 const sub_bindings, const max_width = try iterateBindings(alloc, &n_iter, win);
 
                 // Prepend the current keybind onto the list of sub-binds
                 for (sub_bindings) |*nb| {
-                    const prepend_node = try alloc.create(TriggerList.Node);
-                    prepend_node.* = TriggerList.Node{ .data = bind.key_ptr.* };
-                    nb.triggers.prepend(prepend_node);
+                    const prepend_node = try alloc.create(TriggerNode);
+                    prepend_node.* = .{ .data = bind.key_ptr.* };
+                    nb.triggers.prepend(&prepend_node.node);
                 }
 
                 // Add the longest sub-bind width to the current bind width along with a padding
                 // of 5 for the '  >  ' spacer
                 widest_chord = @max(widest_chord, width + max_width + 5);
-                try bindings.appendSlice(sub_bindings);
+                try bindings.appendSlice(alloc, sub_bindings);
             },
             .leaf => |leaf| {
-                const node = try alloc.create(TriggerList.Node);
-                node.* = TriggerList.Node{ .data = bind.key_ptr.* };
-                const triggers = TriggerList{
-                    .first = node,
-                };
+                const node = try alloc.create(TriggerNode);
+                node.* = .{ .data = bind.key_ptr.* };
+
+                const actions = try alloc.alloc(Binding.Action, 1);
+                actions[0] = leaf.action;
 
                 widest_chord = @max(widest_chord, width);
-                try bindings.append(.{ .triggers = triggers, .action = leaf.action });
+                try bindings.append(alloc, .{
+                    .triggers = .{ .first = &node.node },
+                    .actions = actions,
+                });
+            },
+            .leaf_chained => |leaf| {
+                const node = try alloc.create(TriggerNode);
+                node.* = .{ .data = bind.key_ptr.* };
+
+                widest_chord = @max(widest_chord, width);
+                try bindings.append(alloc, .{
+                    .triggers = .{ .first = &node.node },
+                    .actions = leaf.actions.items,
+                });
             },
         }
     }
 
-    return .{ try bindings.toOwnedSlice(), widest_chord };
+    return .{ try bindings.toOwnedSlice(alloc), widest_chord };
 }

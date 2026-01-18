@@ -1,5 +1,4 @@
 const std = @import("std");
-const assert = std.debug.assert;
 const font = @import("../main.zig");
 
 /// SVG glyphs description table.
@@ -67,14 +66,13 @@ pub const SVG = struct {
         // Slow path: binary search our records
         return std.sort.binarySearch(
             [12]u8,
-            glyph_id,
             self.records,
-            {},
+            glyph_id,
             compareGlyphId,
         ) != null;
     }
 
-    fn compareGlyphId(_: void, glyph_id: u16, record: [12]u8) std.math.Order {
+    fn compareGlyphId(glyph_id: u16, record: [12]u8) std.math.Order {
         const start, const end = glyphRange(&record) catch return .lt;
         if (glyph_id < start) {
             return .lt;
@@ -100,7 +98,7 @@ test "SVG" {
     const alloc = testing.allocator;
     const testFont = font.embedded.julia_mono;
 
-    var lib = try font.Library.init();
+    var lib = try font.Library.init(alloc);
     defer lib.deinit();
 
     var face = try font.Face.init(lib, testFont, .{ .size = .{ .points = 12 } });

@@ -1,6 +1,5 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const objc = @import("objc");
 const macos = @import("macos");
@@ -12,7 +11,7 @@ const macos = @import("macos");
 /// but handles macOS using NSProcessInfo instead of libc argc/argv.
 pub fn iterator(allocator: Allocator) ArgIterator.InitError!ArgIterator {
     //if (true) return try std.process.argsWithAllocator(allocator);
-    return ArgIterator.initWithAllocator(allocator);
+    return .initWithAllocator(allocator);
 }
 
 /// Duck-typed to std.process.ArgIterator

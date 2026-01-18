@@ -6,9 +6,10 @@ pub const Thread = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const xev = @import("xev");
 const macos = @import("macos");
 
+const internal_os = @import("../os/main.zig");
+const xev = @import("../global.zig").xev;
 const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
 
 const Allocator = std.mem.Allocator;
@@ -106,7 +107,7 @@ pub fn threadMain(self: *Thread) void {
     // If our loop is not stopped, then we need to keep running so that
     // messages are drained and we can wait for the surface to send a stop
     // message.
-    if (!self.loop.flags.stopped) {
+    if (!self.loop.stopped()) {
         log.warn("abrupt cf release thread exit detected, starting xev to drain mailbox", .{});
         defer log.debug("cf release thread fully exiting after abnormal failure", .{});
         self.flags.drain = true;
@@ -118,6 +119,13 @@ pub fn threadMain(self: *Thread) void {
 
 fn threadMain_(self: *Thread) !void {
     defer log.debug("cf release thread exited", .{});
+
+    // Right now, on Darwin, `std.Thread.setName` can only name the current
+    // thread, and we have no way to get the current thread from within it,
+    // so instead we use this code to name the thread instead.
+    if (builtin.os.tag.isDarwin()) {
+        internal_os.macos.pthread_setname_np(&"cf_release".*);
+    }
 
     // Start the async handlers. We start these first so that they're
     // registered even if anything below fails so we can drain the mailbox.

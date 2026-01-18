@@ -7,6 +7,7 @@ on:
       upload:
         description: "Upload final artifacts to R2"
         default: false
+
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
@@ -38,7 +39,7 @@ jobs:
 
           echo "Version is valid: ${{ github.event.inputs.version }}"
 
-      - name: Exract the Version
+      - name: Extract the Version
         id: extract_version
         run: |
           if [[ "${{ github.event_name }}" == "push" ]]; then
@@ -55,7 +56,7 @@ jobs:
           fi
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           # Important so that build number generation works
           fetch-depth: 0
@@ -76,22 +77,33 @@ jobs:
     needs: [setup]
     env:
       GHOSTTY_VERSION: ${{ needs.setup.outputs.version }}
+      ZIG_LOCAL_CACHE_DIR: /zig/local-cache
+      ZIG_GLOBAL_CACHE_DIR: /zig/global-cache
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
-      - uses: cachix/install-nix-action@v30
+      - name: Setup Cache
+        uses: namespacelabs/nscloud-cache-action@446d8f390563cd54ca27e8de5bdb816f63c0b706 # v1.2.21
+        with:
+          path: |
+            /nix
+            /zig
+
+      - uses: cachix/install-nix-action@4e002c8ec80594ecd40e759629461e26c8abed15 # v31.9.0
         with:
           nix_path: nixpkgs=channel:nixos-unstable
 
-      - uses: cachix/cachix-action@v15
+      - uses: cachix/cachix-action@0fc020193b5a1fa3ac4575aa3a7d3aa6a35435ad # v16
         with:
           name: ghostty
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
       - name: Create Tarball
         run: |
-          git archive --format=tgz --prefix="ghostty-${GHOSTTY_VERSION}/" -o "ghostty-${GHOSTTY_VERSION}.tar.gz" HEAD
-          git archive --format=tgz --prefix=ghostty-source/ -o ghostty-source.tar.gz HEAD
+          rm -rf zig-out/dist
+          nix develop -c zig build distcheck
+          cp zig-out/dist/ghostty-${GHOSTTY_VERSION}.tar.gz .
+          cp zig-out/dist/ghostty-${GHOSTTY_VERSION}.tar.gz ghostty-source.tar.gz
 
       - name: Sign Tarball
         run: |
@@ -101,7 +113,7 @@ jobs:
           nix develop -c minisign -S -m "ghostty-source.tar.gz" -s minisign.key < minisign.password
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: source-tarball
           path: |-
@@ -112,7 +124,7 @@ jobs:
 
   build-macos:
     needs: [setup]
-    runs-on: namespace-profile-ghostty-macos
+    runs-on: namespace-profile-ghostty-macos-tahoe
     timeout-minutes: 90
     env:
       GHOSTTY_VERSION: ${{ needs.setup.outputs.version }}
@@ -120,22 +132,25 @@ jobs:
       GHOSTTY_COMMIT: ${{ needs.setup.outputs.commit }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
-      - uses: cachix/install-nix-action@v30
+      - uses: DeterminateSystems/nix-installer-action@main
         with:
-          nix_path: nixpkgs=channel:nixos-unstable
-      - uses: cachix/cachix-action@v15
+          determinate: true
+      - uses: cachix/cachix-action@0fc020193b5a1fa3ac4575aa3a7d3aa6a35435ad # v16
         with:
           name: ghostty
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
       - name: XCode Select
-        run: sudo xcode-select -s /Applications/Xcode_16.0.app
+        run: sudo xcode-select -s /Applications/Xcode_26.2.app
+
+      - name: Xcode Version
+        run: xcodebuild -version
 
       - name: Setup Sparkle
         env:
-          SPARKLE_VERSION: 2.6.3
+          SPARKLE_VERSION: 2.7.3
         run: |
           mkdir -p .action/sparkle
           cd .action/sparkle
@@ -150,6 +165,7 @@ jobs:
           nix develop -c \
             zig build \
             -Doptimize=ReleaseFast \
+            -Demit-macos-app=false \
             -Dversion-string=${GHOSTTY_VERSION}
 
       # The native app is built with native XCode tooling. This also does
@@ -220,14 +236,16 @@ jobs:
 
       - name: "Notarize DMG"
         env:
-          PROD_MACOS_NOTARIZATION_APPLE_ID: ${{ secrets.PROD_MACOS_NOTARIZATION_APPLE_ID }}
-          PROD_MACOS_NOTARIZATION_TEAM_ID: ${{ secrets.PROD_MACOS_NOTARIZATION_TEAM_ID }}
-          PROD_MACOS_NOTARIZATION_PWD: ${{ secrets.PROD_MACOS_NOTARIZATION_PWD }}
+          APPLE_NOTARIZATION_ISSUER: ${{ secrets.APPLE_NOTARIZATION_ISSUER }}
+          APPLE_NOTARIZATION_KEY_ID: ${{ secrets.APPLE_NOTARIZATION_KEY_ID }}
+          APPLE_NOTARIZATION_KEY: ${{ secrets.APPLE_NOTARIZATION_KEY }}
         run: |
           # Store the notarization credentials so that we can prevent a UI password dialog
           # from blocking the CI
           echo "Create keychain profile"
-          xcrun notarytool store-credentials "notarytool-profile" --apple-id "$PROD_MACOS_NOTARIZATION_APPLE_ID" --team-id "$PROD_MACOS_NOTARIZATION_TEAM_ID" --password "$PROD_MACOS_NOTARIZATION_PWD"
+          echo "$APPLE_NOTARIZATION_KEY" > notarization_key.p8
+          xcrun notarytool store-credentials "notarytool-profile" --key notarization_key.p8 --key-id "$APPLE_NOTARIZATION_KEY_ID" --issuer "$APPLE_NOTARIZATION_ISSUER"
+          rm notarization_key.p8
 
           # Here we send the notarization request to the Apple's Notarization service, waiting for the result.
           # This typically takes a few seconds inside a CI environment, but it might take more depending on the App
@@ -251,7 +269,7 @@ jobs:
           zip -9 -r --symlinks ../../../ghostty-macos-universal-dsym.zip Ghostty.app.dSYM/
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: macos
           path: |-
@@ -268,7 +286,7 @@ jobs:
           curl -sL https://sentry.io/get-cli/ | bash
 
       - name: Download macOS Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: macos
 
@@ -280,7 +298,7 @@ jobs:
 
   appcast:
     needs: [setup, build-macos]
-    runs-on: namespace-profile-ghostty-macos
+    runs-on: namespace-profile-ghostty-macos-tahoe
     env:
       GHOSTTY_VERSION: ${{ needs.setup.outputs.version }}
       GHOSTTY_BUILD: ${{ needs.setup.outputs.build }}
@@ -288,16 +306,16 @@ jobs:
       GHOSTTY_COMMIT_LONG: ${{ needs.setup.outputs.commit_long }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
 
       - name: Download macOS Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: macos
 
       - name: Setup Sparkle
         env:
-          SPARKLE_VERSION: 2.6.3
+          SPARKLE_VERSION: 2.7.3
         run: |
           mkdir -p .action/sparkle
           cd .action/sparkle
@@ -322,7 +340,7 @@ jobs:
           mv appcast_new.xml appcast.xml
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: sparkle
           path: |-
@@ -339,17 +357,17 @@ jobs:
       GHOSTTY_VERSION: ${{ needs.setup.outputs.version }}
     steps:
       - name: Download macOS Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: macos
 
       - name: Download Sparkle Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: sparkle
 
       - name: Download Source Tarball Artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: source-tarball
 
@@ -367,23 +385,9 @@ jobs:
           mv ghostty-macos-universal.zip blob/${GHOSTTY_VERSION}/ghostty-macos-universal.zip
           mv ghostty-macos-universal-dsym.zip blob/${GHOSTTY_VERSION}/ghostty-macos-universal-dsym.zip
           mv Ghostty.dmg blob/${GHOSTTY_VERSION}/Ghostty.dmg
+          mv appcast.xml blob/${GHOSTTY_VERSION}/appcast-staged.xml
       - name: Upload to R2
-        uses: ryand56/r2-upload-action@latest
-        with:
-          r2-account-id: ${{ secrets.CF_R2_RELEASE_ACCOUNT_ID }}
-          r2-access-key-id: ${{ secrets.CF_R2_RELEASE_AWS_KEY }}
-          r2-secret-access-key: ${{ secrets.CF_R2_RELEASE_SECRET_KEY }}
-          r2-bucket: ghostty-release
-          source-dir: blob
-          destination-dir: ./
-
-      - name: Prep Appcast
-        run: |
-          rm -rf blob
-          mkdir blob
-          mv appcast.xml blob/appcast.xml
-      - name: Upload Appcast to R2
-        uses: ryand56/r2-upload-action@latest
+        uses: ryand56/r2-upload-action@b801a390acbdeb034c5e684ff5e1361c06639e7c # v1.4
         with:
           r2-account-id: ${{ secrets.CF_R2_RELEASE_ACCOUNT_ID }}
           r2-access-key-id: ${{ secrets.CF_R2_RELEASE_AWS_KEY }}

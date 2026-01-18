@@ -6,16 +6,8 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const posix = std.posix;
 const build_config = @import("build_config.zig");
-const options = @import("build_options");
-const glfw = @import("glfw");
-const glslang = @import("glslang");
 const macos = @import("macos");
-const oni = @import("oniguruma");
 const cli = @import("cli.zig");
-const internal_os = @import("os/main.zig");
-const xev = @import("xev");
-const fontconfig = @import("fontconfig");
-const harfbuzz = @import("harfbuzz");
 const renderer = @import("renderer.zig");
 const apprt = @import("apprt.zig");
 
@@ -37,7 +29,9 @@ pub fn main() !MainReturn {
     // a global is because the C API needs to be able to access this state;
     // no other Zig code should EVER access the global state.
     state.init() catch |err| {
-        const stderr = std.io.getStdErr().writer();
+        var buffer: [1024]u8 = undefined;
+        var stderr_writer = std.fs.File.stderr().writer(&buffer);
+        const stderr = &stderr_writer.interface;
         defer posix.exit(1);
         const ErrSet = @TypeOf(err) || error{Unknown};
         switch (@as(ErrSet, @errorCast(err))) {
@@ -56,6 +50,7 @@ pub fn main() !MainReturn {
 
             else => try stderr.print("invalid CLI invocation err={}\n", .{err}),
         }
+        try stderr.flush();
     };
     defer state.deinit();
     const alloc = state.alloc;
@@ -85,6 +80,9 @@ pub fn main() !MainReturn {
             \\(i.e. Ghostty.app on macOS). This CLI can be used to perform various
             \\actions such as inspecting the version, listing fonts, etc.
             \\
+            \\On macOS, the terminal can also be launched using `open -na Ghostty.app`,
+            \\or `open -na Ghostty.app --args --foo=bar --baz=qux` to pass arguments.
+            \\
             \\We don't have proper help output yet, sorry! Please refer to the
             \\source code or Discord community for help for now. We'll fix this in time.
             \\
@@ -96,11 +94,12 @@ pub fn main() !MainReturn {
     }
 
     // Create our app state
-    var app = try App.create(alloc);
+    const app: *App = try App.create(alloc);
     defer app.destroy();
 
     // Create our runtime app
-    var app_runtime = try apprt.App.init(app, .{});
+    var app_runtime: apprt.App = undefined;
+    try app_runtime.init(app, .{});
     defer app_runtime.terminate();
 
     // Since - by definition - there are no surfaces when first started, the
@@ -119,19 +118,17 @@ fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    // Stuff we can do before the lock
-    const level_txt = comptime level.asText();
-    const prefix = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
-
-    // Lock so we are thread-safe
-    std.debug.lockStdErr();
-    defer std.debug.unlockStdErr();
-
     // On Mac, we use unified logging. To view this:
     //
     //   sudo log stream --level debug --predicate 'subsystem=="com.mitchellh.ghostty"'
     //
-    if (builtin.target.isDarwin()) {
+    // macOS logging is thread safe so no need for locks/mutexes
+    macos: {
+        if (comptime !builtin.target.os.tag.isDarwin()) break :macos;
+        if (!state.logging.macos) break :macos;
+
+        const prefix = if (scope == .default) "" else @tagName(scope) ++ ": ";
+
         // Convert our levels to Mac levels
         const mac_level: macos.os.LogType = switch (level) {
             .debug => .debug,
@@ -144,22 +141,35 @@ fn logFn(
         // but we shouldn't be logging too much.
         const logger = macos.os.Log.create(build_config.bundle_id, @tagName(scope));
         defer logger.release();
-        logger.log(std.heap.c_allocator, mac_level, format, args);
+        logger.log(std.heap.c_allocator, mac_level, prefix ++ format, args);
     }
 
-    switch (state.logging) {
-        .disabled => {},
+    stderr: {
+        // don't log debug messages to stderr unless we are a debug build
+        if (comptime builtin.mode != .Debug and level == .debug) break :stderr;
 
-        .stderr => {
-            // Always try default to send to stderr
-            const stderr = std.io.getStdErr().writer();
-            nosuspend stderr.print(level_txt ++ prefix ++ format ++ "\n", args) catch return;
-        },
+        // skip if we are not logging to stderr
+        if (!state.logging.stderr) break :stderr;
+
+        // Lock so we are thread-safe
+        var buf: [64]u8 = undefined;
+        const stderr = std.debug.lockStderrWriter(&buf);
+        defer std.debug.unlockStderrWriter();
+
+        const level_txt = comptime level.asText();
+        const prefix = if (scope == .default) ": " else "(" ++ @tagName(scope) ++ "): ";
+        nosuspend stderr.print(level_txt ++ prefix ++ format ++ "\n", args) catch break :stderr;
+        nosuspend stderr.flush() catch break :stderr;
     }
 }
 
 pub const std_options: std.Options = .{
     // Our log level is always at least info in every build mode.
+    //
+    // Note, we don't lower this to debug even with conditional logging
+    // via GHOSTTY_LOG because our debug logs are very expensive to
+    // calculate and we want to make sure they're optimized out in
+    // builds.
     .log_level = switch (builtin.mode) {
         .Debug => .debug,
         else => .info,
@@ -180,11 +190,23 @@ test {
     _ = @import("surface_mouse.zig");
 
     // Libraries
+    _ = @import("benchmark/main.zig");
     _ = @import("crash/main.zig");
     _ = @import("datastruct/main.zig");
     _ = @import("inspector/main.zig");
+    _ = @import("lib/main.zig");
     _ = @import("terminal/main.zig");
     _ = @import("terminfo/main.zig");
     _ = @import("simd/main.zig");
+    _ = @import("synthetic/main.zig");
     _ = @import("unicode/main.zig");
+    _ = @import("unicode/props_uucode.zig");
+    _ = @import("unicode/symbols_uucode.zig");
+
+    // Extra
+    _ = @import("extra/bash.zig");
+    _ = @import("extra/fish.zig");
+    _ = @import("extra/sublime.zig");
+    _ = @import("extra/vim.zig");
+    _ = @import("extra/zsh.zig");
 }

@@ -13,7 +13,9 @@
     ·
     <a href="https://ghostty.org/docs">Documentation</a>
     ·
-    <a href="#developing-ghostty">Developing</a>
+    <a href="CONTRIBUTING.md">Contributing</a>
+    ·
+    <a href="HACKING.md">Developing</a>
   </p>
 </p>
 
@@ -48,6 +50,14 @@ See the [download page](https://ghostty.org/download) on the Ghostty website.
 ## Documentation
 
 See the [documentation](https://ghostty.org/docs) on the Ghostty website.
+
+## Contributing and Developing
+
+If you have any ideas, issues, etc. regarding Ghostty, or would like to
+contribute to Ghostty through pull requests, please check out our
+["Contributing to Ghostty"](CONTRIBUTING.md) document. Those who would like
+to get involved with Ghostty's development as well should also read the
+["Developing Ghostty"](HACKING.md) document for more technical details.
 
 ## Roadmap and Status
 
@@ -134,15 +144,22 @@ In addition to being a standalone terminal emulator, Ghostty is a
 C-compatible library for embedding a fast, feature-rich terminal emulator
 in any 3rd party project. This library is called `libghostty`.
 
-This goal is not hypothetical! The macOS app is a `libghostty` consumer.
+Due to the scope of this project, we're breaking libghostty down into
+separate actually libraries, starting with `libghostty-vt`. The goal of
+this project is to focus on parsing terminal sequences and maintaining
+terminal state. This is covered in more detail in this
+[blog post](https://mitchellh.com/writing/libghostty-is-coming).
+
+`libghostty-vt` is already available and usable today for Zig and C and
+is compatible for macOS, Linux, Windows, and WebAssembly. At the time of
+writing this, the API isn't stable yet and we haven't tagged an official
+release, but the core logic is well proven (since Ghostty uses it) and
+we're working hard on it now.
+
+The ultimate goal is not hypothetical! The macOS app is a `libghostty` consumer.
 The macOS app is a native Swift app developed in Xcode and `main()` is
 within Swift. The Swift app links to `libghostty` and uses the C API to
 render terminals.
-
-This step encompasses expanding `libghostty` support to more platforms
-and more use cases. At the time of writing this, `libghostty` is very
-Mac-centric -- particularly around rendering -- and we have work to do to
-expand this to other platforms.
 
 ## Crash Reports
 
@@ -183,86 +200,4 @@ SENTRY_DSN=https://e914ee84fd895c4fe324afa3e53dac76@o4507352570920960.ingest.us.
 > purposely contain sensitive information, but it does contain the full
 > stack memory of each thread at the time of the crash. This information
 > is used to rebuild the stack trace but can also contain sensitive data
-> depending when the crash occurred.
-
-## Developing Ghostty
-
-See the documentation on the Ghostty website for
-[building Ghostty from source](http://ghostty.org/docs/install/build).
-For development, omit the `-Doptimize` flag to build a debug build.
-
-On Linux or macOS, you can use `zig build -Dapp-runtime=glfw run` for a quick
-GLFW-based app for a faster development cycle while developing core
-terminal features. Note that this app is missing many features and is also
-known to crash in certain scenarios, so it is only meant for development
-tasks.
-
-Other useful commands:
-
-- `zig build test` for running unit tests.
-- `zig build test -Dtest-filter=<filter>` for running a specific subset of those unit tests
-- `zig build run -Dconformance=<name>` runs a conformance test case from
-  the `conformance` directory. The `name` is the name of the file. This runs
-  in the current running terminal emulator so if you want to check the
-  behavior of this project, you must run this command in Ghostty.
-
-### Linting
-
-#### Prettier
-
-Ghostty's docs and resources (not including Zig code) are linted using
-[Prettier](https://prettier.io) with out-of-the-box settings. A Prettier CI
-check will fail builds with improper formatting. Therefore, if you are
-modifying anything Prettier will lint, you may want to install it locally and
-run this from the repo root before you commit:
-
-```
-prettier --write .
-```
-
-Make sure your Prettier version matches the version of Prettier in [devShell.nix](https://github.com/ghostty-org/ghostty/blob/main/nix/devShell.nix).
-
-Nix users can use the following command to format with Prettier:
-
-```
-nix develop -c prettier --write .
-```
-
-#### Alejandra
-
-Nix modules are formatted with [Alejandra](https://github.com/kamadorueda/alejandra/). An Alejandra CI check
-will fail builds with improper formatting.
-
-Nix users can use the following command to format with Alejanda:
-
-```
-nix develop -c alejandra .
-```
-
-Non-Nix users should install Alejandra and use the following command to format with Alejandra:
-
-```
-alejandra .
-```
-
-Make sure your Alejandra version matches the version of Alejandra in [devShell.nix](https://github.com/ghostty-org/ghostty/blob/main/nix/devShell.nix).
-
-#### Updating the Zig Cache Fixed-Output Derivation Hash
-
-The Nix package depends on a [fixed-output
-derivation](https://nix.dev/manual/nix/stable/language/advanced-attributes.html#adv-attr-outputHash)
-that manages the Zig package cache. This allows the package to be built in the
-Nix sandbox.
-
-Occasionally (usually when `build.zig.zon` is updated), the hash that
-identifies the cache will need to be updated. There are jobs that monitor the
-hash in CI, and builds will fail if it drifts.
-
-To update it, you can run the following in the repository root:
-
-```
-./nix/build-support/check-zig-cache-hash.sh --update
-```
-
-This will write out the `nix/zigCacheHash.nix` file with the updated hash
-that can then be committed and pushed to fix the builds.
+> depending on when the crash occurred.

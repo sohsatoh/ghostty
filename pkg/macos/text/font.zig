@@ -68,7 +68,7 @@ pub const Font = opaque {
     }
 
     pub fn copyTable(self: *Font, tag: FontTableTag) ?*foundation.Data {
-        return @constCast(@ptrCast(c.CTFontCopyTable(
+        return @ptrCast(@constCast(c.CTFontCopyTable(
             @ptrCast(self),
             @intFromEnum(tag),
             c.kCTFontTableOptionNoOptions,
@@ -90,7 +90,7 @@ pub const Font = opaque {
     }
 
     pub fn createPathForGlyph(self: *Font, glyph: graphics.Glyph) ?*graphics.Path {
-        return @constCast(@ptrCast(c.CTFontCreatePathForGlyph(
+        return @ptrCast(@constCast(c.CTFontCreatePathForGlyph(
             @ptrCast(self),
             glyph,
             null,
@@ -280,7 +280,8 @@ test {
         const cs = try graphics.ColorSpace.createDeviceGray();
         defer cs.release();
         const ctx = try graphics.BitmapContext.create(null, 80, 80, 8, 80, cs, 0);
-        defer ctx.release();
+        const context = graphics.BitmapContext.context;
+        defer context.release(ctx);
 
         var pos = [_]graphics.Point{.{ .x = 0, .y = 0 }};
         font.drawGlyphs(

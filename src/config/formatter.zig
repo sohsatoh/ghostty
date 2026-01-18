@@ -8,61 +8,59 @@ const Key = @import("key.zig").Key;
 /// Returns a single entry formatter for the given field name and writer.
 pub fn entryFormatter(
     name: []const u8,
-    writer: anytype,
-) EntryFormatter(@TypeOf(writer)) {
+    writer: *std.Io.Writer,
+) EntryFormatter {
     return .{ .name = name, .writer = writer };
 }
 
 /// The entry formatter type for a given writer.
-pub fn EntryFormatter(comptime WriterType: type) type {
-    return struct {
-        name: []const u8,
-        writer: WriterType,
+pub const EntryFormatter = struct {
+    name: []const u8,
+    writer: *std.Io.Writer,
 
-        pub fn formatEntry(
-            self: @This(),
-            comptime T: type,
-            value: T,
-        ) !void {
-            return formatter.formatEntry(
-                T,
-                self.name,
-                value,
-                self.writer,
-            );
-        }
-    };
-}
+    pub fn formatEntry(
+        self: @This(),
+        comptime T: type,
+        value: T,
+    ) !void {
+        return formatter.formatEntry(
+            T,
+            self.name,
+            value,
+            self.writer,
+        );
+    }
+};
 
 /// Format a single type with the given name and value.
 pub fn formatEntry(
     comptime T: type,
     name: []const u8,
     value: T,
-    writer: anytype,
+    writer: *std.Io.Writer,
 ) !void {
     switch (@typeInfo(T)) {
-        .Bool, .Int => {
+        .bool, .int => {
             try writer.print("{s} = {}\n", .{ name, value });
             return;
         },
 
-        .Float => {
+        .float => {
             try writer.print("{s} = {d}\n", .{ name, value });
             return;
         },
 
-        .Enum => {
-            try writer.print("{s} = {s}\n", .{ name, @tagName(value) });
+        .@"enum" => {
+            try writer.print("{s} = {t}\n", .{ name, value });
             return;
         },
 
-        .Void => {
+        .void => {
             try writer.print("{s} = \n", .{name});
             return;
         },
 
-        .Optional => |info| {
+        .optional => |info| {
             if (value) |inner| {
                 try formatEntry(
                     info.child,
@@ -77,7 +75,7 @@ pub fn formatEntry(
             return;
         },
 
-        .Pointer => switch (T) {
+        .pointer => switch (T) {
             []const u8,
             [:0]const u8,
             => {
@@ -93,7 +91,7 @@ pub fn formatEntry(
         // This is given the formatter in use so that they can
         // call BACK to our formatEntry to write each primitive
         // value.
-        .Struct => |info| if (@hasDecl(T, "formatEntry")) {
+        .@"struct" => |info| if (@hasDecl(T, "formatEntry")) {
             try value.formatEntry(entryFormatter(name, writer));
             return;
         } else switch (info.layout) {
@@ -114,7 +112,7 @@ pub fn formatEntry(
             else => {},
         },
 
-        .Union => if (@hasDecl(T, "formatEntry")) {
+        .@"union" => if (@hasDecl(T, "formatEntry")) {
             try value.formatEntry(entryFormatter(name, writer));
             return;
         },
@@ -143,22 +141,19 @@ pub const FileFormatter = struct {
     /// Implements std.fmt so it can be used directly with std.fmt.
     pub fn format(
         self: FileFormatter,
-        comptime layout: []const u8,
-        opts: std.fmt.FormatOptions,
-        writer: anytype,
-    ) !void {
-        _ = layout;
-        _ = opts;
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        @setEvalBranchQuota(10_000);
 
         // If we're change-tracking then we need the default config to
         // compare against.
         var default: ?Config = if (self.changed)
-            try Config.default(self.alloc)
+            Config.default(self.alloc) catch return error.WriteFailed
         else
             null;
         defer if (default) |*v| v.deinit();
 
-        inline for (@typeInfo(Config).Struct.fields) |field| {
+        inline for (@typeInfo(Config).@"struct".fields) |field| {
             if (field.name[0] == '_') continue;
 
             const value = @field(self.config, field.name);
@@ -177,12 +172,12 @@ pub const FileFormatter = struct {
                     }
                 }
 
-                try formatEntry(
+                formatEntry(
                     field.type,
                     field.name,
                     value,
                     writer,
-                );
+                ) catch return error.WriteFailed;
 
                 if (do_docs) try writer.print("\n", .{});
             }
@@ -196,7 +191,7 @@ test "format default config" {
     var cfg = try Config.default(alloc);
     defer cfg.deinit();
 
-    var buf = std.ArrayList(u8).init(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
     defer buf.deinit();
 
     // We just make sure this works without errors. We aren't asserting output.
@@ -204,9 +199,9 @@ test "format default config" {
         .alloc = alloc,
         .config = &cfg,
     };
-    try std.fmt.format(buf.writer(), "{}", .{fmt});
+    try fmt.format(&buf.writer);
 
-    //std.log.warn("{s}", .{buf.items});
+    //std.log.warn("{s}", .{buf.written()});
 }
 
 test "format default config changed" {
@@ -216,7 +211,7 @@ test "format default config changed" {
     defer cfg.deinit();
     cfg.@"font-size" = 42;
 
-    var buf = std.ArrayList(u8).init(alloc);
+    var buf: std.Io.Writer.Allocating = .init(alloc);
     defer buf.deinit();
 
     // We just make sure this works without errors. We aren't asserting output.
@@ -225,26 +220,26 @@ test "format default config changed" {
         .config = &cfg,
         .changed = true,
     };
-    try std.fmt.format(buf.writer(), "{}", .{fmt});
+    try fmt.format(&buf.writer);
 
-    //std.log.warn("{s}", .{buf.items});
+    //std.log.warn("{s}", .{buf.written()});
 }
 
 test "formatEntry bool" {
     const testing = std.testing;
 
     {
-        var buf = std.ArrayList(u8).init(testing.allocator);
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
         defer buf.deinit();
-        try formatEntry(bool, "a", true, buf.writer());
-        try testing.expectEqualStrings("a = true\n", buf.items);
+        try formatEntry(bool, "a", true, &buf.writer);
+        try testing.expectEqualStrings("a = true\n", buf.written());
     }
 
     {
-        var buf = std.ArrayList(u8).init(testing.allocator);
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
         defer buf.deinit();
-        try formatEntry(bool, "a", false, buf.writer());
-        try testing.expectEqualStrings("a = false\n", buf.items);
+        try formatEntry(bool, "a", false, &buf.writer);
+        try testing.expectEqualStrings("a = false\n", buf.written());
     }
 }
 
@@ -252,10 +247,10 @@ test "formatEntry int" {
     const testing = std.testing;
 
     {
-        var buf = std.ArrayList(u8).init(testing.allocator);
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
         defer buf.deinit();
-        try formatEntry(u8, "a", 123, buf.writer());
-        try testing.expectEqualStrings("a = 123\n", buf.items);
+        try formatEntry(u8, "a", 123, &buf.writer);
+        try testing.expectEqualStrings("a = 123\n", buf.written());
     }
 }
 
@@ -263,10 +258,10 @@ test "formatEntry float" {
     const testing = std.testing;
 
     {
-        var buf = std.ArrayList(u8).init(testing.allocator);
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
         defer buf.deinit();
-        try formatEntry(f64, "a", 0.7, buf.writer());
-        try testing.expectEqualStrings("a = 0.7\n", buf.items);
+        try formatEntry(f64, "a", 0.7, &buf.writer);
+        try testing.expectEqualStrings("a = 0.7\n", buf.written());
     }
 }
 
@@ -275,10 +270,10 @@ test "formatEntry enum" {
     const Enum = enum { one, two, three };
 
     {
-        var buf = std.ArrayList(u8).init(testing.allocator);
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
         defer buf.deinit();
-        try formatEntry(Enum, "a", .two, buf.writer());
-        try testing.expectEqualStrings("a = two\n", buf.items);
+        try formatEntry(Enum, "a", .two, &buf.writer);
+        try testing.expectEqualStrings("a = two\n", buf.written());
     }
 }
 
@@ -286,10 +281,10 @@ test "formatEntry void" {
     const testing = std.testing;
 
     {
-        var buf = std.ArrayList(u8).init(testing.allocator);
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
         defer buf.deinit();
-        try formatEntry(void, "a", {}, buf.writer());
-        try testing.expectEqualStrings("a = \n", buf.items);
+        try formatEntry(void, "a", {}, &buf.writer);
+        try testing.expectEqualStrings("a = \n", buf.written());
     }
 }
 
@@ -297,17 +292,17 @@ test "formatEntry optional" {
     const testing = std.testing;
 
     {
-        var buf = std.ArrayList(u8).init(testing.allocator);
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
         defer buf.deinit();
-        try formatEntry(?bool, "a", null, buf.writer());
-        try testing.expectEqualStrings("a = \n", buf.items);
+        try formatEntry(?bool, "a", null, &buf.writer);
+        try testing.expectEqualStrings("a = \n", buf.written());
     }
 
     {
-        var buf = std.ArrayList(u8).init(testing.allocator);
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
         defer buf.deinit();
-        try formatEntry(?bool, "a", false, buf.writer());
-        try testing.expectEqualStrings("a = false\n", buf.items);
+        try formatEntry(?bool, "a", false, &buf.writer);
+        try testing.expectEqualStrings("a = false\n", buf.written());
     }
 }
 
@@ -315,10 +310,10 @@ test "formatEntry string" {
     const testing = std.testing;
 
     {
-        var buf = std.ArrayList(u8).init(testing.allocator);
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
         defer buf.deinit();
-        try formatEntry([]const u8, "a", "hello", buf.writer());
-        try testing.expectEqualStrings("a = hello\n", buf.items);
+        try formatEntry([]const u8, "a", "hello", &buf.writer);
+        try testing.expectEqualStrings("a = hello\n", buf.written());
     }
 }
 
@@ -330,9 +325,9 @@ test "formatEntry packed struct" {
     };
 
     {
-        var buf = std.ArrayList(u8).init(testing.allocator);
+        var buf: std.Io.Writer.Allocating = .init(testing.allocator);
         defer buf.deinit();
-        try formatEntry(Value, "a", .{}, buf.writer());
-        try testing.expectEqualStrings("a = one,no-two\n", buf.items);
+        try formatEntry(Value, "a", .{}, &buf.writer);
+        try testing.expectEqualStrings("a = one,no-two\n", buf.written());
     }
 }

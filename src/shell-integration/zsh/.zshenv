@@ -15,11 +15,16 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+# This script is sourced automatically by zsh when ZDOTDIR is set to this
+# directory. It therefore assumes it's running within our shell integration
+# environment and should not be sourced manually (unlike ghostty-integration).
+#
 # This file can get sourced with aliases enabled. To avoid alias expansion
 # we quote everything that can be quoted. Some aliases will still break us
 # though.
 
-# Restore the original ZDOTDIR value.
+# Restore the original ZDOTDIR value if GHOSTTY_ZSH_ZDOTDIR is set.
+# Otherwise, unset the ZDOTDIR that was set during shell injection.
 if [[ -n "${GHOSTTY_ZSH_ZDOTDIR+X}" ]]; then
     'builtin' 'export' ZDOTDIR="$GHOSTTY_ZSH_ZDOTDIR"
     'builtin' 'unset' 'GHOSTTY_ZSH_ZDOTDIR'
@@ -29,24 +34,20 @@ fi
 
 # Use try-always to have the right error code.
 {
-    # Zsh treats empty $ZDOTDIR as if it was "/". We do the same.
+    # Zsh treats unset ZDOTDIR as if it was HOME. We do the same.
     #
-    # Source the user's zshenv before sourcing ghostty.zsh because the former
-    # might set fpath and other things without which ghostty.zsh won't work.
+    # Source the user's .zshenv before sourcing ghostty-integration because the
+    # former might set fpath and other things without which ghostty-integration
+    # won't work.
     #
     # Use typeset in case we are in a function with warn_create_global in
     # effect. Unlikely but better safe than sorry.
-    'builtin' 'typeset' _ghostty_file=${ZDOTDIR-~}"/.zshenv"
+    'builtin' 'typeset' _ghostty_file=${ZDOTDIR-$HOME}"/.zshenv"
     # Zsh ignores unreadable rc files. We do the same.
     # Zsh ignores rc files that are directories, and so does source.
     [[ ! -r "$_ghostty_file" ]] || 'builtin' 'source' '--' "$_ghostty_file"
 } always {
     if [[ -o 'interactive' ]]; then
-        'builtin' 'autoload' '--' 'is-at-least'
-        'is-at-least' "5.1" || {
-            builtin echo "ZSH ${ZSH_VERSION} is too old for ghostty shell integration" > /dev/stderr
-            return
-        }
         # ${(%):-%x} is the path to the current file.
         # On top of it we add :A:h to get the directory.
         'builtin' 'typeset' _ghostty_file="${${(%):-%x}:A:h}"/ghostty-integration

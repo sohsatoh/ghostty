@@ -4,11 +4,10 @@ pub const Thread = @This();
 
 const std = @import("std");
 const builtin = @import("builtin");
-const assert = std.debug.assert;
-const xev = @import("xev");
+const xev = @import("../global.zig").xev;
 const crash = @import("../crash/main.zig");
 const internal_os = @import("../os/main.zig");
-const renderer = @import("../renderer.zig");
+const rendererpkg = @import("../renderer.zig");
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
 const BlockingQueue = @import("../datastruct/main.zig").BlockingQueue;
@@ -20,10 +19,20 @@ const log = std.log.scoped(.renderer_thread);
 const DRAW_INTERVAL = 8; // 120 FPS
 const CURSOR_BLINK_INTERVAL = 600;
 
+/// Whether calls to `drawFrame` must be done from the app thread.
+///
+/// If this is `true` then we send a `redraw_surface` message to the apprt
+/// whenever we need to draw instead of calling `drawFrame` directly.
+const must_draw_from_app_thread =
+    if (@hasDecl(apprt.App, "must_draw_from_app_thread"))
+        apprt.App.must_draw_from_app_thread
+    else
+        false;
+
 /// The type used for sending messages to the IO thread. For now this is
 /// hardcoded with a capacity. We can make this a comptime parameter in
 /// the future if we want it configurable.
-pub const Mailbox = BlockingQueue(renderer.Message, 64);
+pub const Mailbox = BlockingQueue(rendererpkg.Message, 64);
 
 /// Allocator used for some state
 alloc: std.mem.Allocator,
@@ -67,10 +76,10 @@ cursor_c_cancel: xev.Completion = .{},
 surface: *apprt.Surface,
 
 /// The underlying renderer implementation.
-renderer: *renderer.Renderer,
+renderer: *rendererpkg.Renderer,
 
 /// Pointer to the shared state that is used to generate the final render.
-state: *renderer.State,
+state: *rendererpkg.State,
 
 /// The mailbox that can be used to send this thread messages. Note
 /// this is a blocking queue so if it is full you will get errors (or block).
@@ -117,8 +126,8 @@ pub fn init(
     alloc: Allocator,
     config: *const configpkg.Config,
     surface: *apprt.Surface,
-    renderer_impl: *renderer.Renderer,
-    state: *renderer.State,
+    renderer_impl: *rendererpkg.Renderer,
+    state: *rendererpkg.State,
     app_mailbox: App.Mailbox,
 ) !Thread {
     // Create our event loop.
@@ -155,7 +164,7 @@ pub fn init(
 
     return .{
         .alloc = alloc,
-        .config = DerivedConfig.init(config),
+        .config = .init(config),
         .loop = loop,
         .wakeup = wakeup_h,
         .stop = stop_h,
@@ -198,6 +207,13 @@ pub fn threadMain(self: *Thread) void {
 fn threadMain_(self: *Thread) !void {
     defer log.debug("renderer thread exited", .{});
 
+    // Right now, on Darwin, `std.Thread.setName` can only name the current
+    // thread, and we have no way to get the current thread from within it,
+    // so instead we use this code to name the thread instead.
+    if (builtin.os.tag.isDarwin()) {
+        internal_os.macos.pthread_setname_np(&"renderer".*);
+    }
+
     // Setup our crash metadata
     crash.sentry.thread_state = .{
         .type = .renderer,
@@ -209,7 +225,7 @@ fn threadMain_(self: *Thread) !void {
     self.setQosClass();
 
     // Run our loop start/end callbacks if the renderer cares.
-    const has_loop = @hasDecl(renderer.Renderer, "loopEnter");
+    const has_loop = @hasDecl(rendererpkg.Renderer, "loopEnter");
     if (has_loop) try self.renderer.loopEnter(self);
     defer if (has_loop) self.renderer.loopExit();
 
@@ -231,7 +247,7 @@ fn threadMain_(self: *Thread) !void {
     self.cursor_h.run(
         &self.loop,
         &self.cursor_c,
-        CURSOR_BLINK_INTERVAL,
+        cursorBlinkInterval(),
         Thread,
         self,
         cursorTimerCallback,
@@ -248,7 +264,7 @@ fn threadMain_(self: *Thread) !void {
 
 fn setQosClass(self: *const Thread) void {
     // Thread QoS classes are only relevant on macOS.
-    if (comptime !builtin.target.isDarwin()) return;
+    if (comptime !builtin.target.os.tag.isDarwin()) return;
 
     const class: internal_os.macos.QosClass = class: {
         // If we aren't visible (our view is fully occluded) then we
@@ -278,7 +294,7 @@ fn setQosClass(self: *const Thread) void {
 
 fn startDrawTimer(self: *Thread) void {
     // If our renderer doesn't support animations then we never run this.
-    if (!@hasDecl(renderer.Renderer, "hasAnimations")) return;
+    if (!@hasDecl(rendererpkg.Renderer, "hasAnimations")) return;
     if (!self.renderer.hasAnimations()) return;
     if (self.config.custom_shader_animation == .false) return;
 
@@ -307,6 +323,16 @@ fn stopDrawTimer(self: *Thread) void {
 
 /// Drain the mailbox.
 fn drainMailbox(self: *Thread) !void {
+    // There's probably a more elegant way to do this...
+    //
+    // This is effectively an @autoreleasepool{} block, which we need in
+    // order to ensure that autoreleased objects are properly released.
+    const pool = if (builtin.os.tag.isDarwin())
+        @import("objc").AutoreleasePool.init()
+    else
+        void;
+    defer if (builtin.os.tag.isDarwin()) pool.deinit();
+
     while (self.mailbox.pop()) |message| {
         log.debug("mailbox message={}", .{message});
         switch (message) {
@@ -381,7 +407,7 @@ fn drainMailbox(self: *Thread) !void {
                         self.cursor_h.run(
                             &self.loop,
                             &self.cursor_c,
-                            CURSOR_BLINK_INTERVAL,
+                            cursorBlinkInterval(),
                             Thread,
                             self,
                             cursorTimerCallback,
@@ -397,7 +423,7 @@ fn drainMailbox(self: *Thread) !void {
                         &self.loop,
                         &self.cursor_c,
                         &self.cursor_c_cancel,
-                        CURSOR_BLINK_INTERVAL,
+                        cursorBlinkInterval(),
                         Thread,
                         self,
                         cursorTimerCallback,
@@ -410,22 +436,7 @@ fn drainMailbox(self: *Thread) !void {
                 grid.set.deref(grid.old_key);
             },
 
-            .foreground_color => |color| {
-                self.renderer.foreground_color = color;
-                self.renderer.markDirty();
-            },
-
-            .background_color => |color| {
-                self.renderer.background_color = color;
-                self.renderer.markDirty();
-            },
-
-            .cursor_color => |color| {
-                self.renderer.cursor_color = color;
-                self.renderer.markDirty();
-            },
-
-            .resize => |v| try self.renderer.setScreenSize(v),
+            .resize => |v| self.renderer.setScreenSize(v),
 
             .change_config => |config| {
                 defer config.alloc.destroy(config.thread);
@@ -439,10 +450,26 @@ fn drainMailbox(self: *Thread) !void {
                 self.startDrawTimer();
             },
 
+            .search_viewport_matches => |v| {
+                // Note we don't free the new value because we expect our
+                // allocators to match.
+                if (self.renderer.search_matches) |*m| m.arena.deinit();
+                self.renderer.search_matches = v;
+                self.renderer.search_matches_dirty = true;
+            },
+
+            .search_selected_match => |v| {
+                // Note we don't free the new value because we expect our
+                // allocators to match.
+                if (self.renderer.search_selected_match) |*m| m.arena.deinit();
+                self.renderer.search_selected_match = v;
+                self.renderer.search_matches_dirty = true;
+            },
+
             .inspector => |v| self.flags.has_inspector = v,
 
             .macos_display_id => |v| {
-                if (@hasDecl(renderer.Renderer, "setMacOSDisplayID")) {
+                if (@hasDecl(rendererpkg.Renderer, "setMacOSDisplayID")) {
                     try self.renderer.setMacOSDisplayID(v);
                 }
             },
@@ -461,20 +488,16 @@ fn drawFrame(self: *Thread, now: bool) void {
     if (!self.flags.visible) return;
 
     // If the renderer is managing a vsync on its own, we only draw
-    // when we're forced to via now.
+    // when we're forced to via `now`.
     if (!now and self.renderer.hasVsync()) return;
 
-    // If we're doing single-threaded GPU calls then we just wake up the
-    // app thread to redraw at this point.
-    if (renderer.Renderer == renderer.OpenGL and
-        renderer.OpenGL.single_threaded_draw)
-    {
+    if (must_draw_from_app_thread) {
         _ = self.app_mailbox.push(
             .{ .redraw_surface = self.surface },
             .{ .instant = {} },
         );
     } else {
-        self.renderer.drawFrame(self.surface) catch |err|
+        self.renderer.drawFrame(false) catch |err|
             log.warn("error drawing err={}", .{err});
     }
 }
@@ -582,7 +605,6 @@ fn renderCallback(
 
     // Update our frame data
     t.renderer.updateFrame(
-        t.surface,
         t.state,
         t.flags.cursor_blink_visible,
     ) catch |err|
@@ -619,7 +641,14 @@ fn cursorTimerCallback(
     t.flags.cursor_blink_visible = !t.flags.cursor_blink_visible;
     t.wakeup.notify() catch {};
 
-    t.cursor_h.run(&t.loop, &t.cursor_c, CURSOR_BLINK_INTERVAL, Thread, t, cursorTimerCallback);
+    t.cursor_h.run(
+        &t.loop,
+        &t.cursor_c,
+        cursorBlinkInterval(),
+        Thread,
+        t,
+        cursorTimerCallback,
+    );
     return .disarm;
 }
 
@@ -664,4 +693,20 @@ fn stopCallback(
     _ = r catch unreachable;
     self_.?.loop.stop();
     return .disarm;
+}
+
+/// Returns the interval for the blinking cursor in milliseconds.
+fn cursorBlinkInterval() u64 {
+    if (std.valgrind.runningOnValgrind() > 0) {
+        // If we're running under Valgrind, the cursor blink adds enough
+        // churn that it makes some stalls annoying unless you're on a
+        // super powerful computer, so we delay it.
+        //
+        // This is a hack, we should change some of our cursor timer
+        // logic to be more efficient:
+        // https://github.com/ghostty-org/ghostty/issues/8003
+        return CURSOR_BLINK_INTERVAL * 5;
+    }
+
+    return CURSOR_BLINK_INTERVAL;
 }

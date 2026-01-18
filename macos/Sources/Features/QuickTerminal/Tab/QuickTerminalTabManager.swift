@@ -1,3 +1,4 @@
+import Cocoa
 import GhosttyKit
 
 class QuickTerminalTabManager: ObservableObject {
@@ -12,13 +13,16 @@ class QuickTerminalTabManager: ObservableObject {
     }
 
     func newTab() {
-        guard let ghostty = controller?.ghostty else { return }
+        guard let ghostty = controller?.ghostty,
+              let ghostty_app = ghostty.app else { return }
 
-        let leaf: Ghostty.SplitNode.Leaf = .init(ghostty.app!, baseConfig: nil)
-        let surface: Ghostty.SplitNode = .leaf(leaf)
-        let tabIndex = tabs.count + 1
+        var config = Ghostty.SurfaceConfiguration()
+        config.environmentVariables["GHOSTTY_QUICK_TERMINAL"] = "1"
+        
+        let view = Ghostty.SurfaceView(ghostty_app, baseConfig: config)
+        let tree = SplitTree(view: view)
 
-        let newTab = QuickTerminalTab(surface: surface, title: "Terminal \(tabIndex)")
+        let newTab = QuickTerminalTab(surfaceTree: tree)
         tabs.append(newTab)
 
         selectTab(newTab)
@@ -31,7 +35,7 @@ class QuickTerminalTabManager: ObservableObject {
         tab.isActive = true
         currentTab = tab
 
-        controller?.updateSurfaceTree(to: tab.surface)
+        controller?.updateSurfaceTree(to: tab.surfaceTree)
     }
 
     func closeTab(_ tab: QuickTerminalTab) {
@@ -40,7 +44,7 @@ class QuickTerminalTabManager: ObservableObject {
 
             if currentTab?.id == tab.id {
                 if tabs.isEmpty {
-                    newTab()
+                    currentTab = nil
                     controller?.animateOut()
                 } else {
                     let newIndex = min(index, tabs.count - 1)

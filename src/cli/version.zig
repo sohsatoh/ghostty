@@ -4,19 +4,23 @@ const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
 const build_config = @import("../build_config.zig");
 const internal_os = @import("../os/main.zig");
-const xev = @import("xev");
+const xev = @import("../global.zig").xev;
 const renderer = @import("../renderer.zig");
-const gtk = if (build_config.app_runtime == .gtk) @import("../apprt/gtk/c.zig").c else void;
+
+const gtk_version = @import("../apprt/gtk/gtk_version.zig");
+const adw_version = @import("../apprt/gtk/adw_version.zig");
 
 pub const Options = struct {};
 
 /// The `version` command is used to display information about Ghostty. Recognized as
 /// either `+version` or `--version`.
 pub fn run(alloc: Allocator) !u8 {
-    _ = alloc;
+    var buffer: [1024]u8 = undefined;
+    const stdout_file: std.fs.File = .stdout();
+    var stdout_writer = stdout_file.writer(&buffer);
 
-    const stdout = std.io.getStdOut().writer();
-    const tty = std.io.getStdOut().isTty();
+    const stdout = &stdout_writer.interface;
+    const tty = stdout_file.isTty();
 
     if (tty) if (build_config.version.build) |commit_hash| {
         try stdout.print(
@@ -29,54 +33,44 @@ pub fn run(alloc: Allocator) !u8 {
 
     try stdout.print("Version\n", .{});
     try stdout.print("  - version: {s}\n", .{build_config.version_string});
-    try stdout.print("  - channel: {s}\n", .{@tagName(build_config.release_channel)});
+    try stdout.print("  - channel: {t}\n", .{build_config.release_channel});
 
     try stdout.print("Build Config\n", .{});
-    try stdout.print("  - Zig version: {s}\n", .{builtin.zig_version_string});
-    try stdout.print("  - build mode : {}\n", .{builtin.mode});
-    try stdout.print("  - app runtime: {}\n", .{build_config.app_runtime});
-    try stdout.print("  - font engine: {}\n", .{build_config.font_backend});
-    try stdout.print("  - renderer   : {}\n", .{renderer.Renderer});
-    try stdout.print("  - libxev     : {}\n", .{xev.backend});
+    try stdout.print("  - Zig version   : {s}\n", .{builtin.zig_version_string});
+    try stdout.print("  - build mode    : {}\n", .{builtin.mode});
+    try stdout.print("  - app runtime   : {}\n", .{build_config.app_runtime});
+    try stdout.print("  - font engine   : {}\n", .{build_config.font_backend});
+    try stdout.print("  - renderer      : {}\n", .{renderer.Renderer});
+    try stdout.print("  - libxev        : {t}\n", .{xev.backend});
     if (comptime build_config.app_runtime == .gtk) {
-        try stdout.print("  - desktop env: {s}\n", .{@tagName(internal_os.desktopEnvironment())});
-        try stdout.print("  - GTK version:\n", .{});
-        try stdout.print("    build      : {d}.{d}.{d}\n", .{
-            gtk.GTK_MAJOR_VERSION,
-            gtk.GTK_MINOR_VERSION,
-            gtk.GTK_MICRO_VERSION,
-        });
-        try stdout.print("    runtime    : {d}.{d}.{d}\n", .{
-            gtk.gtk_get_major_version(),
-            gtk.gtk_get_minor_version(),
-            gtk.gtk_get_micro_version(),
-        });
-        if (comptime build_options.adwaita) {
-            try stdout.print("  - libadwaita : enabled\n", .{});
-            try stdout.print("    build      : {s}\n", .{
-                gtk.ADW_VERSION_S,
-            });
-            try stdout.print("    runtime    : {}.{}.{}\n", .{
-                gtk.adw_get_major_version(),
-                gtk.adw_get_minor_version(),
-                gtk.adw_get_micro_version(),
-            });
-        } else {
-            try stdout.print("  - libadwaita : disabled\n", .{});
+        if (comptime builtin.os.tag == .linux) {
+            const kernel_info = internal_os.getKernelInfo(alloc);
+            defer if (kernel_info) |k| alloc.free(k);
+            try stdout.print("  - kernel version: {s}\n", .{kernel_info orelse "Kernel information unavailable"});
         }
+        try stdout.print("  - desktop env   : {t}\n", .{internal_os.desktopEnvironment()});
+        try stdout.print("  - GTK version   :\n", .{});
+        try stdout.print("    build         : {f}\n", .{gtk_version.comptime_version});
+        try stdout.print("    runtime       : {f}\n", .{gtk_version.getRuntimeVersion()});
+        try stdout.print("  - libadwaita    : enabled\n", .{});
+        try stdout.print("    build         : {f}\n", .{adw_version.comptime_version});
+        try stdout.print("    runtime       : {f}\n", .{adw_version.getRuntimeVersion()});
         if (comptime build_options.x11) {
-            try stdout.print("  - libX11     : enabled\n", .{});
+            try stdout.print("  - libX11        : enabled\n", .{});
         } else {
-            try stdout.print("  - libX11     : disabled\n", .{});
+            try stdout.print("  - libX11        : disabled\n", .{});
         }
 
         // We say `libwayland` since it is possible to build Ghostty without
         // Wayland integration but with Wayland-enabled GTK
         if (comptime build_options.wayland) {
-            try stdout.print("  - libwayland : enabled\n", .{});
+            try stdout.print("  - libwayland    : enabled\n", .{});
         } else {
-            try stdout.print("  - libwayland : disabled\n", .{});
+            try stdout.print("  - libwayland    : disabled\n", .{});
         }
     }
+
+    // Don't forget to flush!
+    try stdout.flush();
     return 0;
 }

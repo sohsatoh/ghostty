@@ -1,11 +1,9 @@
 const std = @import("std");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
 
 const size = @import("size.zig");
 const Offset = size.Offset;
 const OffsetBuf = size.OffsetBuf;
-
-const fastmem = @import("../fastmem.zig");
 
 /// A reference counted set.
 ///
@@ -38,8 +36,14 @@ const fastmem = @import("../fastmem.zig");
 ///
 /// `Context`
 ///   A type containing methods to define behaviors.
+///
 ///   - `fn hash(*Context, T) u64`    - Return a hash for an item.
+///
 ///   - `fn eql(*Context, T, T) bool` - Check two items for equality.
+///     The first of the two items passed in is guaranteed to be from
+///     a value passed in to an `add` or `lookup` function, the second
+///     is guaranteed to be a value already resident in the set.
+///
 ///   - `fn deleted(*Context, T) void` - [OPTIONAL] Deletion callback.
 ///     If present, called whenever an item is finally deleted.
 ///     Useful if the item has memory that needs to be freed.
@@ -53,12 +57,12 @@ pub fn RefCountedSet(
     return struct {
         const Self = @This();
 
-        pub const base_align = @max(
+        pub const base_align: std.mem.Alignment = .fromByteUnits(@max(
             @alignOf(Context),
             @alignOf(Layout),
             @alignOf(Item),
             @alignOf(Id),
-        );
+        ));
 
         /// Set item
         pub const Item = struct {
@@ -109,7 +113,7 @@ pub fn RefCountedSet(
         /// input. We handle this gracefully by returning an error
         /// anywhere where we're about to insert if there's any
         /// item with a PSL in the last slot of the stats array.
-        psl_stats: [32]Id = [_]Id{0} ** 32,
+        psl_stats: [32]Id = @splat(0),
 
         /// The backing store of items
         items: Offset(Item),
@@ -126,60 +130,6 @@ pub fn RefCountedSet(
         /// An instance of the context structure.
         context: Context,
 
-        /// Returns the memory layout for the given base offset and
-        /// desired capacity. The layout can be used by the caller to
-        /// determine how much memory to allocate, and the layout must
-        /// be used to initialize the set so that the set knows all
-        /// the offsets for the various buffers.
-        ///
-        /// The capacity passed for cap will be used for the hash table,
-        /// which has a load factor of `0.8125` (13/16), so the number of
-        /// items which can actually be stored in the set will be smaller.
-        ///
-        /// The laid out capacity will be at least `cap`, but may be higher,
-        /// since it is rounded up to the next power of 2 for efficiency.
-        ///
-        /// The returned layout `cap` property will be 1 more than the number
-        /// of items that the set can actually store, since ID 0 is reserved.
-        pub fn layout(cap: usize) Layout {
-            // Experimentally, this load factor works quite well.
-            const load_factor = 0.8125;
-
-            assert(cap <= @as(usize, @intCast(std.math.maxInt(Id))) + 1);
-
-            // Zero-cap set is valid, return special case
-            if (cap == 0) return .{
-                .cap = 0,
-                .table_cap = 0,
-                .table_mask = 0,
-                .table_start = 0,
-                .items_start = 0,
-                .total_size = 0,
-            };
-
-            const table_cap: usize = std.math.ceilPowerOfTwoAssert(usize, cap);
-            const items_cap: usize = @intFromFloat(load_factor * @as(f64, @floatFromInt(table_cap)));
-
-            const table_mask: Id = @intCast((@as(usize, 1) << std.math.log2_int(usize, table_cap)) - 1);
-
-            const table_start = 0;
-            const table_end = table_start + table_cap * @sizeOf(Id);
-
-            const items_start = std.mem.alignForward(usize, table_end, @alignOf(Item));
-            const items_end = items_start + items_cap * @sizeOf(Item);
-
-            const total_size = items_end;
-
-            return .{
-                .cap = items_cap,
-                .table_cap = table_cap,
-                .table_mask = table_mask,
-                .table_start = table_start,
-                .items_start = items_start,
-                .total_size = total_size,
-            };
-        }
-
         pub const Layout = struct {
             cap: usize,
             table_cap: usize,
@@ -187,6 +137,60 @@ pub fn RefCountedSet(
             table_start: usize,
             items_start: usize,
             total_size: usize,
+
+            /// Returns the memory layout for the given base offset and
+            /// desired capacity. The layout can be used by the caller to
+            /// determine how much memory to allocate, and the layout must
+            /// be used to initialize the set so that the set knows all
+            /// the offsets for the various buffers.
+            ///
+            /// The capacity passed for cap will be used for the hash table,
+            /// which has a load factor of `0.8125` (13/16), so the number of
+            /// items which can actually be stored in the set will be smaller.
+            ///
+            /// The laid out capacity will be at least `cap`, but may be higher,
+            /// since it is rounded up to the next power of 2 for efficiency.
+            ///
+            /// The returned layout `cap` property will be 1 more than the number
+            /// of items that the set can actually store, since ID 0 is reserved.
+            pub fn init(cap: usize) Layout {
+                // Experimentally, this load factor works quite well.
+                const load_factor = 0.8125;
+
+                assert(cap <= @as(usize, @intCast(std.math.maxInt(Id))) + 1);
+
+                // Zero-cap set is valid, return special case
+                if (cap == 0) return .{
+                    .cap = 0,
+                    .table_cap = 0,
+                    .table_mask = 0,
+                    .table_start = 0,
+                    .items_start = 0,
+                    .total_size = 0,
+                };
+
+                const table_cap: usize = std.math.ceilPowerOfTwoAssert(usize, cap);
+                const items_cap: usize = @intFromFloat(load_factor * @as(f64, @floatFromInt(table_cap)));
+
+                const table_mask: Id = @intCast((@as(usize, 1) << std.math.log2_int(usize, table_cap)) - 1);
+
+                const table_start = 0;
+                const table_end = table_start + table_cap * @sizeOf(Id);
+
+                const items_start = std.mem.alignForward(usize, table_end, @alignOf(Item));
+                const items_end = items_start + items_cap * @sizeOf(Item);
+
+                const total_size = items_end;
+
+                return .{
+                    .cap = items_cap,
+                    .table_cap = table_cap,
+                    .table_mask = table_mask,
+                    .table_start = table_start,
+                    .items_start = items_start,
+                    .total_size = total_size,
+                };
+            }
         };
 
         pub fn init(base: OffsetBuf, l: Layout, context: Context) Self {
@@ -211,7 +215,7 @@ pub fn RefCountedSet(
             OutOfMemory,
 
             /// The set needs to be rehashed, as there are many dead
-            /// items with lower IDs which are inaccessible for re-use.
+            /// items with lower IDs which are inaccessible for reuse.
             NeedsRehash,
         };
 
@@ -250,6 +254,7 @@ pub fn RefCountedSet(
             // we may end up with a PSL of `len` which would exceed the bounds.
             // In such a case, we claim to be out of memory.
             if (self.psl_stats[self.psl_stats.len - 1] > 0) {
+                @branchHint(.cold);
                 return AddError.OutOfMemory;
             }
 
@@ -302,6 +307,7 @@ pub fn RefCountedSet(
                 if (items[id].meta.ref == 0) {
                     // See comment in `addContext` for details.
                     if (self.psl_stats[self.psl_stats.len - 1] > 0) {
+                        @branchHint(.cold);
                         return AddError.OutOfMemory;
                     }
 
@@ -431,7 +437,7 @@ pub fn RefCountedSet(
         }
 
         /// Delete an item, removing any references from
-        /// the table, and freeing its ID to be re-used.
+        /// the table, and freeing its ID to be reused.
         fn deleteItem(self: *Self, base: anytype, id: Id, ctx: Context) void {
             const table = self.table.ptr(base);
             const items = self.items.ptr(base);
@@ -507,14 +513,11 @@ pub fn RefCountedSet(
                     return null;
                 }
 
-                // We don't bother checking dead items.
-                if (item.meta.ref == 0) {
-                    continue;
-                }
-
                 // If the item is a part of the same probe sequence,
-                // we check if it matches the value we're looking for.
+                // we make sure it's not dead and then check to see
+                // if it matches the value we're looking for.
                 if (item.meta.psl == i and
+                    item.meta.ref > 0 and
                     ctx.eql(value, item.value))
                 {
                     return id;
@@ -543,9 +546,12 @@ pub fn RefCountedSet(
         }
 
         /// Insert the given value into the hash table with the given ID.
-        /// asserts that the value is not already present in the table.
+        ///
+        /// If runtime safety is enabled, asserts that
+        /// the value is not already present in the table.
         fn insert(self: *Self, base: anytype, value: T, new_id: Id, ctx: Context) Id {
-            assert(self.lookupContext(base, value, ctx) == null);
+            if (comptime std.debug.runtime_safety)
+                assert(self.lookupContext(base, value, ctx) == null);
 
             const table = self.table.ptr(base);
             const items = self.items.ptr(base);
@@ -579,10 +585,15 @@ pub fn RefCountedSet(
                 const item = &items[id];
 
                 // If there's a dead item then we resurrect it
-                // for our value so that we can re-use its ID,
+                // for our value so that we can reuse its ID,
                 // unless its ID is greater than the one we're
                 // given (i.e. prefer smaller IDs).
                 if (item.meta.ref == 0) {
+                    // Dead items aren't super common relative
+                    // to other places to insert/swap the held
+                    // item in to the set.
+                    @branchHint(.unlikely);
+
                     if (comptime @hasDecl(Context, "deleted")) {
                         // Inform the context struct that we're
                         // deleting the dead item's value for good.
@@ -615,7 +626,7 @@ pub fn RefCountedSet(
                 // to minimize the time it takes to find it.
                 if (item.meta.psl < held_item.meta.psl or
                     item.meta.psl == held_item.meta.psl and
-                    item.meta.ref < held_item.meta.ref)
+                        item.meta.ref < held_item.meta.ref)
                 {
                     // Put our held item in the bucket.
                     table[p] = held_id;
@@ -634,7 +645,7 @@ pub fn RefCountedSet(
             }
 
             // Our chosen ID may have changed if we decided
-            // to re-use a dead item's ID, so we make sure
+            // to reuse a dead item's ID, so we make sure
             // the chosen bucket contains the correct ID.
             table[new_item.meta.bucket] = chosen_id;
 
@@ -657,7 +668,7 @@ pub fn RefCountedSet(
                 const table = self.table.ptr(base);
                 const items = self.items.ptr(base);
 
-                var psl_stats: [32]Id = [_]Id{0} ** 32;
+                var psl_stats: [32]Id = @splat(0);
 
                 for (items[0..self.layout.cap], 0..) |item, id| {
                     if (item.meta.bucket < std.math.maxInt(Id)) {
@@ -670,7 +681,7 @@ pub fn RefCountedSet(
 
                 assert(std.mem.eql(Id, &psl_stats, &self.psl_stats));
 
-                psl_stats = [_]Id{0} ** 32;
+                psl_stats = @splat(0);
 
                 for (table[0..self.layout.table_cap], 0..) |id, bucket| {
                     const item = items[id];

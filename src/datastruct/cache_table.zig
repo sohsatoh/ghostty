@@ -1,7 +1,7 @@
 const fastmem = @import("../fastmem.zig");
 
 const std = @import("std");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
 
 /// An associative data structure used for efficiently storing and
 /// retrieving values which are able to be recomputed if necessary.
@@ -70,7 +70,7 @@ pub fn CacheTable(
         /// become a pointless check, but hopefully branch prediction picks
         /// up on it at that point. The memory cost isn't too bad since it's
         /// just bytes, so should be a fraction the size of the main table.
-        lengths: [bucket_count]u8 = [_]u8{0} ** bucket_count,
+        lengths: [bucket_count]u8 = @splat(0),
 
         /// An instance of the context structure.
         /// Must be initialized before calling any operations.

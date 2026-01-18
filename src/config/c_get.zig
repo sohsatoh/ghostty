@@ -53,21 +53,21 @@ fn getValue(ptr_raw: *anyopaque, value: anytype) bool {
         },
 
         else => |T| switch (@typeInfo(T)) {
-            .Optional => {
+            .optional => {
                 // If an optional has no value we return false.
                 const unwrapped = value orelse return false;
                 return getValue(ptr_raw, unwrapped);
             },
 
-            .Enum => {
+            .@"enum" => {
                 const ptr: *[*:0]const u8 = @ptrCast(@alignCast(ptr_raw));
                 ptr.* = @tagName(value);
             },
 
-            .Struct => |info| {
+            .@"struct" => |info| {
                 // If the struct implements cval then we call then.
                 if (@hasDecl(T, "cval")) {
-                    const PtrT = @typeInfo(@TypeOf(T.cval)).Fn.return_type.?;
+                    const PtrT = @typeInfo(@TypeOf(T.cval)).@"fn".return_type.?;
                     const ptr: *PtrT = @ptrCast(@alignCast(ptr_raw));
                     ptr.* = value.cval();
                     return true;
@@ -84,9 +84,9 @@ fn getValue(ptr_raw: *anyopaque, value: anytype) bool {
                 ptr.* = @intCast(@as(Backing, @bitCast(value)));
             },
 
-            .Union => |_| {
+            .@"union" => |_| {
                 if (@hasDecl(T, "cval")) {
-                    const PtrT = @typeInfo(@TypeOf(T.cval)).Fn.return_type.?;
+                    const PtrT = @typeInfo(@TypeOf(T.cval)).@"fn".return_type.?;
                     const ptr: *PtrT = @ptrCast(@alignCast(ptr_raw));
                     ptr.* = value.cval();
                     return true;
@@ -193,20 +193,48 @@ test "c_get: background-blur" {
 
     {
         c.@"background-blur" = .false;
-        var cval: u8 = undefined;
+        var cval: i16 = undefined;
         try testing.expect(get(&c, .@"background-blur", @ptrCast(&cval)));
         try testing.expectEqual(0, cval);
     }
     {
         c.@"background-blur" = .true;
-        var cval: u8 = undefined;
+        var cval: i16 = undefined;
         try testing.expect(get(&c, .@"background-blur", @ptrCast(&cval)));
         try testing.expectEqual(20, cval);
     }
     {
         c.@"background-blur" = .{ .radius = 42 };
-        var cval: u8 = undefined;
+        var cval: i16 = undefined;
         try testing.expect(get(&c, .@"background-blur", @ptrCast(&cval)));
         try testing.expectEqual(42, cval);
     }
+    {
+        c.@"background-blur" = .@"macos-glass-regular";
+        var cval: i16 = undefined;
+        try testing.expect(get(&c, .@"background-blur", @ptrCast(&cval)));
+        try testing.expectEqual(-1, cval);
+    }
+    {
+        c.@"background-blur" = .@"macos-glass-clear";
+        var cval: i16 = undefined;
+        try testing.expect(get(&c, .@"background-blur", @ptrCast(&cval)));
+        try testing.expectEqual(-2, cval);
+    }
+}
+
+test "c_get: split-preserve-zoom" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var c = try Config.default(alloc);
+    defer c.deinit();
+
+    var bits: c_uint = undefined;
+    try testing.expect(get(&c, .@"split-preserve-zoom", @ptrCast(&bits)));
+    try testing.expectEqual(@as(c_uint, 0), bits);
+
+    c.@"split-preserve-zoom".navigation = true;
+    try testing.expect(get(&c, .@"split-preserve-zoom", @ptrCast(&bits)));
+    try testing.expectEqual(@as(c_uint, 1), bits);
 }

@@ -1,6 +1,6 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const cimgui = @import("cimgui");
+const cimgui = @import("dcimgui");
 const terminal = @import("../terminal/main.zig");
 const CircBuf = @import("../datastruct/main.zig").CircBuf;
 const Surface = @import("../Surface.zig");
@@ -43,9 +43,9 @@ pub const VTEvent = struct {
     ) !VTEvent {
         var md = Metadata.init(alloc);
         errdefer md.deinit();
-        var buf = std.ArrayList(u8).init(alloc);
+        var buf: std.Io.Writer.Allocating = .init(alloc);
         defer buf.deinit();
-        try encodeAction(alloc, buf.writer(), &md, action);
+        try encodeAction(alloc, &buf.writer, &md, action);
         const str = try buf.toOwnedSliceSentinel(0);
         errdefer alloc.free(str);
 
@@ -64,7 +64,7 @@ pub const VTEvent = struct {
         return .{
             .kind = kind,
             .str = str,
-            .cursor = t.screen.cursor,
+            .cursor = t.screens.active.cursor,
             .scrolling_region = t.scrolling_region,
             .metadata = md.unmanaged,
         };
@@ -83,7 +83,7 @@ pub const VTEvent = struct {
     /// Returns true if the event passes the given filter.
     pub fn passFilter(
         self: *const VTEvent,
-        filter: *cimgui.c.ImGuiTextFilter,
+        filter: *const cimgui.c.ImGuiTextFilter,
     ) bool {
         // Check our main string
         if (cimgui.c.ImGuiTextFilter_PassFilter(
@@ -115,7 +115,7 @@ pub const VTEvent = struct {
     /// Encode a parser action as a string that we show in the logs.
     fn encodeAction(
         alloc: Allocator,
-        writer: anytype,
+        writer: *std.Io.Writer,
         md: *Metadata,
         action: terminal.Parser.Action,
     ) !void {
@@ -125,16 +125,16 @@ pub const VTEvent = struct {
             .csi_dispatch => |v| try encodeCSI(writer, v),
             .esc_dispatch => |v| try encodeEsc(writer, v),
             .osc_dispatch => |v| try encodeOSC(alloc, writer, md, v),
-            else => try writer.print("{}", .{action}),
+            else => try writer.print("{f}", .{action}),
         }
     }
 
-    fn encodePrint(writer: anytype, action: terminal.Parser.Action) !void {
+    fn encodePrint(writer: *std.Io.Writer, action: terminal.Parser.Action) !void {
         const ch = action.print;
         try writer.print("'{u}' (U+{X})", .{ ch, ch });
     }
 
-    fn encodeExecute(writer: anytype, action: terminal.Parser.Action) !void {
+    fn encodeExecute(writer: *std.Io.Writer, action: terminal.Parser.Action) !void {
         const ch = action.execute;
         switch (ch) {
             0x00 => try writer.writeAll("NUL"),
@@ -158,7 +158,7 @@ pub const VTEvent = struct {
         try writer.print(" (0x{X})", .{ch});
     }
 
-    fn encodeCSI(writer: anytype, csi: terminal.Parser.Action.CSI) !void {
+    fn encodeCSI(writer: *std.Io.Writer, csi: terminal.Parser.Action.CSI) !void {
         for (csi.intermediates) |v| try writer.print("{c} ", .{v});
         for (csi.params, 0..) |v, i| {
             if (i != 0) try writer.writeByte(';');
@@ -168,14 +168,14 @@ pub const VTEvent = struct {
         try writer.writeByte(csi.final);
     }
 
-    fn encodeEsc(writer: anytype, esc: terminal.Parser.Action.ESC) !void {
+    fn encodeEsc(writer: *std.Io.Writer, esc: terminal.Parser.Action.ESC) !void {
         for (esc.intermediates) |v| try writer.print("{c} ", .{v});
         try writer.writeByte(esc.final);
     }
 
     fn encodeOSC(
         alloc: Allocator,
-        writer: anytype,
+        writer: *std.Io.Writer,
         md: *Metadata,
         osc: terminal.osc.Command,
     ) !void {
@@ -197,9 +197,11 @@ pub const VTEvent = struct {
     ) !void {
         switch (@TypeOf(v)) {
             void => {},
-            []const u8 => try md.put("data", try alloc.dupeZ(u8, v)),
+            []const u8,
+            [:0]const u8,
+            => try md.put("data", try alloc.dupeZ(u8, v)),
             else => |T| switch (@typeInfo(T)) {
-                .Struct => |info| inline for (info.fields) |field| {
+                .@"struct" => |info| inline for (info.fields) |field| {
                     try encodeMetadataSingle(
                         alloc,
                         md,
@@ -208,7 +210,7 @@ pub const VTEvent = struct {
                     );
                 },
 
-                .Union => |info| {
+                .@"union" => |info| {
                     const Tag = info.tag_type orelse @compileError("Unions must have a tag");
                     const tag_name = @tagName(@as(Tag, v));
                     inline for (info.fields) |field| {
@@ -239,56 +241,64 @@ pub const VTEvent = struct {
         const Value = @TypeOf(value);
         const info = @typeInfo(Value);
         switch (info) {
-            .Optional => if (value) |unwrapped| {
+            .optional => if (value) |unwrapped| {
                 try encodeMetadataSingle(alloc, md, key, unwrapped);
             } else {
                 try md.put(key, try alloc.dupeZ(u8, "(unset)"));
             },
 
-            .Bool => try md.put(
+            .bool => try md.put(
                 key,
                 try alloc.dupeZ(u8, if (value) "true" else "false"),
             ),
 
-            .Enum => try md.put(
+            .@"enum" => try md.put(
                 key,
                 try alloc.dupeZ(u8, @tagName(value)),
             ),
 
-            .Union => |u| {
+            .@"union" => |u| {
                 const Tag = u.tag_type orelse @compileError("Unions must have a tag");
                 const tag_name = @tagName(@as(Tag, value));
                 inline for (u.fields) |field| {
                     if (std.mem.eql(u8, field.name, tag_name)) {
                         const s = if (field.type == void)
                             try alloc.dupeZ(u8, tag_name)
-                        else
-                            try std.fmt.allocPrintZ(alloc, "{s}={}", .{
+                        else if (field.type == [:0]const u8 or field.type == []const u8)
+                            try std.fmt.allocPrintSentinel(alloc, "{s}={s}", .{
                                 tag_name,
                                 @field(value, field.name),
-                            });
+                            }, 0)
+                        else
+                            try std.fmt.allocPrintSentinel(alloc, "{s}={}", .{
+                                tag_name,
+                                @field(value, field.name),
+                            }, 0);
 
                         try md.put(key, s);
                     }
                 }
             },
 
-            .Struct => try md.put(
+            .@"struct" => try md.put(
                 key,
                 try alloc.dupeZ(u8, @typeName(Value)),
             ),
 
             else => switch (Value) {
-                u8, u16 => try md.put(
-                    key,
-                    try std.fmt.allocPrintZ(alloc, "{}", .{value}),
-                ),
+                []const u8,
+                [:0]const u8,
+                => try md.put(key, try alloc.dupeZ(u8, value)),
 
-                []const u8 => try md.put(key, try alloc.dupeZ(u8, value)),
-
-                else => |T| {
-                    @compileLog(T);
-                    @compileError("unsupported type, see log");
+                else => |T| switch (@typeInfo(T)) {
+                    .int => try md.put(
+                        key,
+                        try std.fmt.allocPrintSentinel(alloc, "{}", .{value}, 0),
+                    ),
+                    else => {
+                        @compileLog(T);
+                        @compileError("unsupported type, see log");
+                    },
                 },
             },
         }
@@ -308,20 +318,28 @@ pub const VTHandler = struct {
     current_seq: usize = 1,
 
     /// Exclude certain actions by tag.
-    filter_exclude: ActionTagSet = ActionTagSet.initMany(&.{.print}),
-    filter_text: *cimgui.c.ImGuiTextFilter,
+    filter_exclude: ActionTagSet = .initMany(&.{.print}),
+    filter_text: cimgui.c.ImGuiTextFilter = .{},
 
     const ActionTagSet = std.EnumSet(terminal.Parser.Action.Tag);
 
     pub fn init(surface: *Surface) VTHandler {
         return .{
             .surface = surface,
-            .filter_text = cimgui.c.ImGuiTextFilter_ImGuiTextFilter(""),
         };
     }
 
     pub fn deinit(self: *VTHandler) void {
-        cimgui.c.ImGuiTextFilter_destroy(self.filter_text);
+        _ = self;
+    }
+
+    pub fn vt(
+        self: *VTHandler,
+        comptime action: Stream.Action.Tag,
+        value: Stream.Action.Value(action),
+    ) !void {
+        _ = self;
+        _ = value;
     }
 
     /// This is called with every single terminal action.
@@ -353,7 +371,7 @@ pub const VTHandler = struct {
         errdefer ev.deinit(alloc);
 
         // Check if the event passes the filter
-        if (!ev.passFilter(self.filter_text)) {
+        if (!ev.passFilter(&self.filter_text)) {
             ev.deinit(alloc);
             return true;
         }

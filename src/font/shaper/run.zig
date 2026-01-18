@@ -1,5 +1,5 @@
 const std = @import("std");
-const assert = std.debug.assert;
+const assert = @import("../../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const font = @import("../main.zig");
 const shape = @import("../shape.zig");
@@ -17,9 +17,15 @@ pub const TextRun = struct {
     /// lower the chance of hash collisions if they become a problem. If
     /// there are hash collisions, it would result in rendering issues but
     /// the core data would be correct.
+    ///
+    /// The hash is position-independent within the row by using relative
+    /// cluster positions. This allows identical runs in different positions
+    /// to share the same cache entry, improving cache efficiency.
     hash: u64,
 
-    /// The offset in the row where this run started
+    /// The offset in the row where this run started. This is added to the
+    /// X position of the final shaped cells to get the absolute position
+    /// in the row where they belong.
     offset: u16,
 
     /// The total number of cells produced by this run.
@@ -35,15 +41,14 @@ pub const TextRun = struct {
 /// RunIterator is an iterator that yields text runs.
 pub const RunIterator = struct {
     hooks: font.Shaper.RunIteratorHook,
-    grid: *font.SharedGrid,
-    screen: *const terminal.Screen,
-    row: terminal.Pin,
-    selection: ?terminal.Selection = null,
-    cursor_x: ?usize = null,
+    opts: shape.RunOptions,
     i: usize = 0,
 
     pub fn next(self: *RunIterator, alloc: Allocator) !?TextRun {
-        const cells = self.row.cells(.all);
+        const slice = &self.opts.cells;
+        const cells: []const terminal.page.Cell = slice.items(.raw);
+        const graphemes: []const []const u21 = slice.items(.grapheme);
+        const styles: []const terminal.Style = slice.items(.style);
 
         // Trim the right side of a row that might be empty
         const max: usize = max: {
@@ -58,10 +63,8 @@ pub const RunIterator = struct {
         // Invisible cells don't have any glyphs rendered,
         // so we explicitly skip them in the shaping process.
         while (self.i < max and
-            self.row.style(&cells[self.i]).flags.invisible)
-        {
-            self.i += 1;
-        }
+            (cells[self.i].hasStyling() and
+                styles[self.i].flags.invisible)) self.i += 1;
 
         // We're over at the max
         if (self.i >= max) return null;
@@ -76,27 +79,24 @@ pub const RunIterator = struct {
         var hasher = Hasher.init(0);
 
         // Let's get our style that we'll expect for the run.
-        const style = self.row.style(&cells[self.i]);
+        const style: terminal.Style = if (cells[self.i].hasStyling()) styles[self.i] else .{};
 
         // Go through cell by cell and accumulate while we build our run.
         var j: usize = self.i;
         while (j < max) : (j += 1) {
-            const cluster = j;
-            const cell = &cells[j];
+            // Use relative cluster positions (offset from run start) to make
+            // the shaping cache position-independent. This ensures that runs
+            // with identical content but different starting positions in the
+            // row produce the same hash, enabling cache reuse.
+            const cluster = j - self.i;
+            const cell: *const terminal.page.Cell = &cells[j];
 
             // If we have a selection and we're at a boundary point, then
             // we break the run here.
-            if (self.selection) |unordered_sel| {
+            if (self.opts.selection) |bounds| {
                 if (j > self.i) {
-                    const sel = unordered_sel.ordered(self.screen, .forward);
-                    const start_x = sel.start().x;
-                    const end_x = sel.end().x;
-
-                    if (start_x > 0 and
-                        j == start_x) break;
-
-                    if (end_x > 0 and
-                        j == end_x + 1) break;
+                    if (bounds[0] > 0 and j == bounds[0]) break;
+                    if (bounds[1] > 0 and j == bounds[1] + 1) break;
                 }
             }
 
@@ -142,7 +142,7 @@ pub const RunIterator = struct {
                 // The style is different. We allow differing background
                 // styles but any other change results in a new run.
                 const c1 = comparableStyle(style);
-                const c2 = comparableStyle(self.row.style(&cells[j]));
+                const c2 = comparableStyle(if (cell.hasStyling()) styles[j] else .{});
                 if (!c1.eql(c2)) break;
             }
 
@@ -162,7 +162,7 @@ pub const RunIterator = struct {
             const presentation: ?font.Presentation = if (cell.hasGrapheme()) p: {
                 // We only check the FIRST codepoint because I believe the
                 // presentation format must be directly adjacent to the codepoint.
-                const cps = self.row.grapheme(cell) orelse break :p null;
+                const cps = graphemes[j];
                 assert(cps.len > 0);
                 if (cps[0] == 0xFE0E) break :p .text;
                 if (cps[0] == 0xFE0F) break :p .emoji;
@@ -186,7 +186,7 @@ pub const RunIterator = struct {
             // joiners will show the joiners allowing you to modify the
             // emoji.
             if (!cell.hasGrapheme()) {
-                if (self.cursor_x) |cursor_x| {
+                if (self.opts.cursor_x) |cursor_x| {
                     // Exactly: self.i is the cursor and we iterated once. This
                     // means that we started exactly at the cursor and did at
                     // exactly one iteration. Why exactly one? Because we may
@@ -221,13 +221,14 @@ pub const RunIterator = struct {
                 if (try self.indexForCell(
                     alloc,
                     cell,
+                    graphemes[j],
                     font_style,
                     presentation,
                 )) |idx| break :font_info .{ .idx = idx };
 
                 // Otherwise we need a fallback character. Prefer the
                 // official replacement character.
-                if (try self.grid.getIndex(
+                if (try self.opts.grid.getIndex(
                     alloc,
                     0xFFFD, // replacement char
                     font_style,
@@ -235,7 +236,7 @@ pub const RunIterator = struct {
                 )) |idx| break :font_info .{ .idx = idx, .fallback = 0xFFFD };
 
                 // Fallback to space
-                if (try self.grid.getIndex(
+                if (try self.opts.grid.getIndex(
                     alloc,
                     ' ',
                     font_style,
@@ -251,7 +252,7 @@ pub const RunIterator = struct {
             if (j == self.i) current_font = font_info.idx;
 
             // If our fonts are not equal, then we're done with our run.
-            if (font_info.idx.int() != current_font.int()) break;
+            if (font_info.idx != current_font) break;
 
             // If we're a fallback character, add that and continue; we
             // don't want to add the entire grapheme.
@@ -273,8 +274,7 @@ pub const RunIterator = struct {
                 @intCast(cluster),
             );
             if (cell.hasGrapheme()) {
-                const cps = self.row.grapheme(cell).?;
-                for (cps) |cp| {
+                for (graphemes[j]) |cp| {
                     // Do not send presentation modifiers
                     if (cp == 0xFE0E or cp == 0xFE0F) continue;
                     try self.addCodepoint(&hasher, cp, @intCast(cluster));
@@ -294,11 +294,11 @@ pub const RunIterator = struct {
         // Move our cursor. Must defer since we use self.i below.
         defer self.i = j;
 
-        return TextRun{
+        return .{
             .hash = hasher.final(),
             .offset = @intCast(self.i),
             .cells = @intCast(j - self.i),
-            .grid = self.grid,
+            .grid = self.opts.grid,
             .font_index = current_font,
         };
     }
@@ -318,7 +318,8 @@ pub const RunIterator = struct {
     fn indexForCell(
         self: *RunIterator,
         alloc: Allocator,
-        cell: *terminal.Cell,
+        cell: *const terminal.Cell,
+        graphemes: []const u21,
         style: font.Style,
         presentation: ?font.Presentation,
     ) !?font.Collection.Index {
@@ -326,7 +327,7 @@ pub const RunIterator = struct {
             cell.codepoint() == 0 or
             cell.codepoint() == terminal.kitty.graphics.unicode.placeholder)
         {
-            return try self.grid.getIndex(
+            return try self.opts.grid.getIndex(
                 alloc,
                 ' ',
                 style,
@@ -336,7 +337,7 @@ pub const RunIterator = struct {
 
         // Get the font index for the primary codepoint.
         const primary_cp: u32 = cell.codepoint();
-        const primary = try self.grid.getIndex(
+        const primary = try self.opts.grid.getIndex(
             alloc,
             primary_cp,
             style,
@@ -349,33 +350,40 @@ pub const RunIterator = struct {
 
         // If this is a grapheme, we need to find a font that supports
         // all of the codepoints in the grapheme.
-        const cps = self.row.grapheme(cell) orelse return primary;
-        var candidates = try std.ArrayList(font.Collection.Index).initCapacity(alloc, cps.len + 1);
-        defer candidates.deinit();
+        var candidates: std.ArrayList(font.Collection.Index) = try .initCapacity(
+            alloc,
+            graphemes.len + 1,
+        );
+        defer candidates.deinit(alloc);
         candidates.appendAssumeCapacity(primary);
 
-        for (cps) |cp| {
+        for (graphemes) |cp| {
             // Ignore Emoji ZWJs
             if (cp == 0xFE0E or cp == 0xFE0F or cp == 0x200D) continue;
 
             // Find a font that supports this codepoint. If none support this
             // then the whole grapheme can't be rendered so we return null.
-            const idx = try self.grid.getIndex(
+            //
+            // We explicitly do not require the additional grapheme components
+            // to support the base presentation, since it is common for emoji
+            // fonts to support the base emoji with emoji presentation but not
+            // certain ZWJ-combined characters like the male and female signs.
+            const idx = try self.opts.grid.getIndex(
                 alloc,
                 cp,
                 style,
-                presentation,
+                null,
             ) orelse return null;
             candidates.appendAssumeCapacity(idx);
         }
 
         // We need to find a candidate that has ALL of our codepoints
         for (candidates.items) |idx| {
-            if (!self.grid.hasCodepoint(idx, primary_cp, presentation)) continue;
-            for (cps) |cp| {
+            if (!self.opts.grid.hasCodepoint(idx, primary_cp, presentation)) continue;
+            for (graphemes) |cp| {
                 // Ignore Emoji ZWJs
                 if (cp == 0xFE0E or cp == 0xFE0F or cp == 0x200D) continue;
-                if (!self.grid.hasCodepoint(idx, cp, presentation)) break;
+                if (!self.opts.grid.hasCodepoint(idx, cp, null)) break;
             } else {
                 // If the while completed, then we have a candidate that
                 // supports all of our codepoints.

@@ -1,15 +1,18 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const c = @import("../c.zig").c;
+
+const gdk = @import("gdk");
+
 const Config = @import("../../../config.zig").Config;
 const input = @import("../../../input.zig");
+const ApprtWindow = @import("../class/window.zig").Window;
 
 const log = std.log.scoped(.winproto_noop);
 
 pub const App = struct {
     pub fn init(
         _: Allocator,
-        _: *c.GdkDisplay,
+        _: *gdk.Display,
         _: [:0]const u8,
         _: *const Config,
     ) !?App {
@@ -23,19 +26,23 @@ pub const App = struct {
 
     pub fn eventMods(
         _: *App,
-        _: ?*c.GdkDevice,
-        _: c.GdkModifierType,
+        _: ?*gdk.Device,
+        _: gdk.ModifierType,
     ) ?input.Mods {
         return null;
     }
+
+    pub fn supportsQuickTerminal(_: App) bool {
+        return false;
+    }
+    pub fn initQuickTerminal(_: *App, _: *ApprtWindow) !void {}
 };
 
 pub const Window = struct {
     pub fn init(
         _: Allocator,
         _: *App,
-        _: *c.GtkWindow,
-        _: *const Config,
+        _: *ApprtWindow,
     ) !Window {
         return .{};
     }
@@ -47,7 +54,7 @@ pub const Window = struct {
 
     pub fn updateConfigEvent(
         _: *Window,
-        _: *const Config,
+        _: *const ApprtWindow.DerivedConfig,
     ) !void {}
 
     pub fn resizeEvent(_: *Window) !void {}
@@ -61,4 +68,8 @@ pub const Window = struct {
         _ = self;
         return true;
     }
+
+    pub fn addSubprocessEnv(_: *Window, _: *std.process.EnvMap) !void {}
+
+    pub fn setUrgent(_: *Window, _: bool) !void {}
 };

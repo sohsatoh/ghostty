@@ -1,18 +1,22 @@
 import Cocoa
 
-/// The state stored for terminal window restoration.
-class TerminalRestorableState: Codable {
-    static let selfKey = "state"
-    static let versionKey = "version"
-    static let version: Int = 2
+protocol TerminalRestorable: Codable {
+    static var selfKey: String { get }
+    static var versionKey: String { get }
+    static var version: Int { get }
+    init(copy other: Self)
 
-    let focusedSurface: String?
-    let surfaceTree: Ghostty.SplitNode?
+    /// Returns a base configuration to use when restoring terminal surfaces.
+    /// Override this to provide custom environment variables or other configuration.
+    var baseConfig: Ghostty.SurfaceConfiguration? { get }
+}
 
-    init(from controller: TerminalController) {
-        self.focusedSurface = controller.focusedSurface?.uuid.uuidString
-        self.surfaceTree = controller.surfaceTree
-    }
+extension TerminalRestorable {
+    static var selfKey: String { "state" }
+    static var versionKey: String { "version" }
+
+    /// Default implementation returns nil (no custom base config).
+    var baseConfig: Ghostty.SurfaceConfiguration? { nil }
 
     init?(coder aDecoder: NSCoder) {
         // If the version doesn't match then we can't decode. In the future we can perform
@@ -26,13 +30,39 @@ class TerminalRestorableState: Codable {
             return nil
         }
 
-        self.surfaceTree = v.value.surfaceTree
-        self.focusedSurface = v.value.focusedSurface
+        self.init(copy: v.value)
     }
 
     func encode(with coder: NSCoder) {
         coder.encode(Self.version, forKey: Self.versionKey)
         coder.encode(CodableBridge(self), forKey: Self.selfKey)
+    }
+}
+
+/// The state stored for terminal window restoration.
+class TerminalRestorableState: TerminalRestorable {
+    class var version: Int { 7 }
+
+    let focusedSurface: String?
+    let surfaceTree: SplitTree<Ghostty.SurfaceView>
+    let effectiveFullscreenMode: FullscreenMode?
+    let tabColor: TerminalTabColor
+    let titleOverride: String?
+
+    init(from controller: TerminalController) {
+        self.focusedSurface = controller.focusedSurface?.id.uuidString
+        self.surfaceTree = controller.surfaceTree
+        self.effectiveFullscreenMode = controller.fullscreenStyle?.fullscreenMode
+        self.tabColor = (controller.window as? TerminalWindow)?.tabColor ?? .none
+        self.titleOverride = controller.titleOverride
+    }
+
+    required init(copy other: TerminalRestorableState) {
+        self.surfaceTree = other.surfaceTree
+        self.focusedSurface = other.focusedSurface
+        self.effectiveFullscreenMode = other.effectiveFullscreenMode
+        self.tabColor = other.tabColor
+        self.titleOverride = other.titleOverride
     }
 }
 
@@ -83,21 +113,45 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         // can be found for events from libghostty. This uses the low-level
         // createWindow so that AppKit can place the window wherever it should
         // be.
-        let c = appDelegate.terminalManager.createWindow(withSurfaceTree: state.surfaceTree)
+        let c = TerminalController.init(
+            appDelegate.ghostty,
+            withSurfaceTree: state.surfaceTree)
         guard let window = c.window else {
             completionHandler(nil, TerminalRestoreError.windowDidNotLoad)
             return
         }
 
+        // Restore our tab color
+        (window as? TerminalWindow)?.tabColor = state.tabColor
+
+        // Restore the tab title override
+        c.titleOverride = state.titleOverride
+
         // Setup our restored state on the controller
-        if let focusedStr = state.focusedSurface,
-           let focusedUUID = UUID(uuidString: focusedStr),
-           let view = c.surfaceTree?.findUUID(uuid: focusedUUID) {
-            c.focusedSurface = view
-            restoreFocus(to: view, inWindow: window)
+        // Find the focused surface in surfaceTree
+        if let focusedStr = state.focusedSurface {
+            var foundView: Ghostty.SurfaceView?
+            for view in c.surfaceTree {
+                if view.id.uuidString == focusedStr {
+                    foundView = view
+                    break
+                }
+            }
+            
+            if let view = foundView {
+                c.focusedSurface = view
+                restoreFocus(to: view, inWindow: window)
+            }
         }
 
         completionHandler(window, nil)
+        guard let mode = state.effectiveFullscreenMode, mode != .native else {
+            // We let AppKit handle native fullscreen
+            return
+        }
+        // Give the window to AppKit first, then adjust its frame and style
+        // to minimise any visible frame changes.
+        c.toggleFullscreen(mode: mode)
     }
 
     /// This restores the focus state of the surfaceview within the given window. When restoring,
@@ -137,3 +191,5 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         }
     }
 }
+
+

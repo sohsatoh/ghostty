@@ -10,7 +10,7 @@ pub const ButtonState = enum(c_int) {
     press,
 };
 
-/// Possible mouse buttons. We only track up to 11 because thats the maximum
+/// Possible mouse buttons. We only track up to 11 because that's the maximum
 /// button input that terminal mouse tracking handles without becoming
 /// ambiguous.
 ///
@@ -27,7 +27,7 @@ pub const Button = enum(c_int) {
     /// packed array, for example.
     pub const max = max: {
         var cur = 0;
-        for (@typeInfo(Self).Enum.fields) |field| {
+        for (@typeInfo(Self).@"enum".fields) |field| {
             if (field.value > cur) cur = field.value;
         }
 

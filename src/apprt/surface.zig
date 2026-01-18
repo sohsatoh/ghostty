@@ -1,16 +1,20 @@
+const std = @import("std");
+const Allocator = std.mem.Allocator;
+
 const apprt = @import("../apprt.zig");
+const build_config = @import("../build_config.zig");
 const App = @import("../App.zig");
 const Surface = @import("../Surface.zig");
 const renderer = @import("../renderer.zig");
-const termio = @import("../termio.zig");
 const terminal = @import("../terminal/main.zig");
 const Config = @import("../config.zig").Config;
+const MessageData = @import("../datastruct/main.zig").MessageData;
 
 /// The message types that can be sent to a single surface.
 pub const Message = union(enum) {
     /// Represents a write request. Magic number comes from the max size
     /// we want this union to be.
-    pub const WriteReq = termio.MessageData(u8, 255);
+    pub const WriteReq = MessageData(u8, 255);
 
     /// Set the title of the surface.
     /// TODO: we should change this to a "WriteReq" style structure in
@@ -43,8 +47,9 @@ pub const Message = union(enum) {
     close: void,
 
     /// The child process running in the surface has exited. This may trigger
-    /// a surface close, it may not.
-    child_exited: void,
+    /// a surface close, it may not. Additional details about the child
+    /// command are given in the `ChildExited` struct.
+    child_exited: ChildExited,
 
     /// Show a desktop notification.
     desktop_notification: struct {
@@ -73,18 +78,61 @@ pub const Message = union(enum) {
     password_input: bool,
 
     /// A terminal color was changed using OSC sequences.
-    color_change: struct {
-        kind: terminal.osc.Command.ColorKind,
-        color: terminal.color.RGB,
-    },
+    color_change: terminal.osc.color.ColoredTarget,
+
+    /// Notifies the surface that a tick of the timer that is timing
+    /// out selection scrolling has occurred. "selection scrolling"
+    /// is when the user has clicked and dragged the mouse outside
+    /// the viewport of the terminal and the terminal is scrolling
+    /// the viewport to follow the mouse cursor.
+    selection_scroll_tick: bool,
 
     /// The terminal has reported a change in the working directory.
     pwd_change: WriteReq,
+
+    /// The terminal encountered a bell character.
+    ring_bell,
+
+    /// Report the progress of an action using a GUI element
+    progress_report: terminal.osc.Command.ProgressReport,
+
+    /// A command has started in the shell, start a timer.
+    start_command,
+
+    /// A command has finished in the shell, stop the timer and send out
+    /// notifications as appropriate. The optional u8 is the exit code
+    /// of the command.
+    stop_command: ?u8,
+
+    /// The scrollbar state changed for the surface.
+    scrollbar: terminal.Scrollbar,
+
+    /// Search progress update
+    search_total: ?usize,
+
+    /// Selected search index change
+    search_selected: ?usize,
 
     pub const ReportTitleStyle = enum {
         csi_21_t,
 
         // This enum is a placeholder for future title styles.
+    };
+
+    pub const ChildExited = extern struct {
+        exit_code: u32,
+        runtime_ms: u64,
+
+        /// Make this a valid gobject if we're in a GTK environment.
+        pub const getGObjectType = switch (build_config.app_runtime) {
+            .gtk,
+            => @import("gobject").ext.defineBoxed(
+                ChildExited,
+                .{ .name = "GhosttyApprtChildExited" },
+            ),
+
+            .none => void,
+        };
     };
 };
 
@@ -111,10 +159,29 @@ pub const Mailbox = struct {
     }
 };
 
+/// Context for new surface creation to determine inheritance behavior
+pub const NewSurfaceContext = enum(c_int) {
+    window = 0,
+    tab = 1,
+    split = 2,
+};
+
+pub fn shouldInheritWorkingDirectory(context: NewSurfaceContext, config: *const Config) bool {
+    return switch (context) {
+        .window => config.@"window-inherit-working-directory",
+        .tab => config.@"tab-inherit-working-directory",
+        .split => config.@"split-inherit-working-directory",
+    };
+}
+
 /// Returns a new config for a surface for the given app that should be
 /// used for any new surfaces. The resulting config should be deinitialized
 /// after the surface is initialized.
-pub fn newConfig(app: *const App, config: *const Config) !Config {
+pub fn newConfig(
+    app: *const App,
+    config: *const Config,
+    context: NewSurfaceContext,
+) Allocator.Error!Config {
     // Create a shallow clone
     var copy = config.shallowClone(app.alloc);
 
@@ -124,7 +191,7 @@ pub fn newConfig(app: *const App, config: *const Config) !Config {
     // Get our previously focused surface for some inherited values.
     const prev = app.focusedSurface();
     if (prev) |p| {
-        if (config.@"window-inherit-working-directory") {
+        if (shouldInheritWorkingDirectory(context, config)) {
             if (try p.pwd(alloc)) |pwd| {
                 copy.@"working-directory" = pwd;
             }

@@ -4,34 +4,37 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const upstream = b.dependency("utfcpp", .{});
-
-    const lib = b.addStaticLibrary(.{
+    const lib = b.addLibrary(.{
         .name = "utfcpp",
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        }),
+        .linkage = .static,
     });
     lib.linkLibCpp();
-    lib.addIncludePath(upstream.path(""));
 
-    if (target.result.isDarwin()) {
+    if (target.result.os.tag.isDarwin()) {
         const apple_sdk = @import("apple_sdk");
-        try apple_sdk.addPaths(b, &lib.root_module);
+        try apple_sdk.addPaths(b, lib);
     }
 
-    var flags = std.ArrayList([]const u8).init(b.allocator);
-    defer flags.deinit();
-    try flags.appendSlice(&.{});
+    var flags: std.ArrayList([]const u8) = .empty;
+    defer flags.deinit(b.allocator);
 
     lib.addCSourceFiles(.{
         .flags = flags.items,
         .files = &.{"empty.cc"},
     });
-    lib.installHeadersDirectory(
-        upstream.path("source"),
-        "",
-        .{ .include_extensions = &.{".h"} },
-    );
+
+    if (b.lazyDependency("utfcpp", .{})) |upstream| {
+        lib.addIncludePath(upstream.path(""));
+        lib.installHeadersDirectory(
+            upstream.path("source"),
+            "",
+            .{ .include_extensions = &.{".h"} },
+        );
+    }
 
     b.installArtifact(lib);
 

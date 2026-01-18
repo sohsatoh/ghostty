@@ -1,6 +1,5 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const assert = std.debug.assert;
 const hash_map = @import("hash_map.zig");
 const AutoOffsetHashMap = hash_map.AutoOffsetHashMap;
 const pagepkg = @import("page.zig");
@@ -14,8 +13,9 @@ const autoHash = std.hash.autoHash;
 const autoHashStrat = std.hash.autoHashStrat;
 
 /// The unique identifier for a hyperlink. This is at most the number of cells
-/// that can fit in a single terminal page.
-pub const Id = size.CellCountInt;
+/// that can fit in a single terminal page, since each cell can only contain
+/// at most one hyperlink.
+pub const Id = size.HyperlinkCountInt;
 
 // The mapping of cell to hyperlink. We use an offset hash map to save space
 // since its very unlikely a cell is a hyperlink, so its a waste to store
@@ -103,7 +103,7 @@ pub const PageEntry = struct {
 
         // Copy the URI
         {
-            const uri = self.uri.offset.ptr(self_page.memory)[0..self.uri.len];
+            const uri = self.uri.slice(self_page.memory);
             const buf = try dst_page.string_alloc.alloc(u8, dst_page.memory, uri.len);
             @memcpy(buf, uri);
             copy.uri = .{
@@ -113,14 +113,14 @@ pub const PageEntry = struct {
         }
         errdefer dst_page.string_alloc.free(
             dst_page.memory,
-            copy.uri.offset.ptr(dst_page.memory)[0..copy.uri.len],
+            copy.uri.slice(dst_page.memory),
         );
 
         // Copy the ID
         switch (copy.id) {
             .implicit => {}, // Shallow is fine
             .explicit => |slice| {
-                const id = slice.offset.ptr(self_page.memory)[0..slice.len];
+                const id = slice.slice(self_page.memory);
                 const buf = try dst_page.string_alloc.alloc(u8, dst_page.memory, id.len);
                 @memcpy(buf, id);
                 copy.id = .{ .explicit = .{
@@ -133,7 +133,7 @@ pub const PageEntry = struct {
             .implicit => {},
             .explicit => |v| dst_page.string_alloc.free(
                 dst_page.memory,
-                v.offset.ptr(dst_page.memory)[0..v.len],
+                v.slice(dst_page.memory),
             ),
         };
 
@@ -147,13 +147,13 @@ pub const PageEntry = struct {
             .implicit => |v| autoHash(&hasher, v),
             .explicit => |slice| autoHashStrat(
                 &hasher,
-                slice.offset.ptr(base)[0..slice.len],
+                slice.slice(base),
                 .Deep,
             ),
         }
         autoHashStrat(
             &hasher,
-            self.uri.offset.ptr(base)[0..self.uri.len],
+            self.uri.slice(base),
             .Deep,
         );
         return hasher.final();
@@ -181,8 +181,27 @@ pub const PageEntry = struct {
 
         return std.mem.eql(
             u8,
-            self.uri.offset.ptr(self_base)[0..self.uri.len],
-            other.uri.offset.ptr(other_base)[0..other.uri.len],
+            self.uri.slice(self_base),
+            other.uri.slice(other_base),
+        );
+    }
+
+    /// Free the memory for this entry from its page.
+    pub fn free(
+        self: *const PageEntry,
+        page: *Page,
+    ) void {
+        const alloc = &page.string_alloc;
+        switch (self.id) {
+            .implicit => {},
+            .explicit => |v| alloc.free(
+                page.memory,
+                v.slice(page.memory),
+            ),
+        }
+        alloc.free(
+            page.memory,
+            self.uri.slice(page.memory),
         );
     }
 };
@@ -194,30 +213,28 @@ pub const Set = RefCountedSet(
     Id,
     size.CellCountInt,
     struct {
+        /// The page which holds the strings for items in this set.
         page: ?*Page = null,
 
+        /// The page which holds the strings for items
+        /// looked up with, e.g., `add` or `lookup`,
+        /// if different from the destination page.
+        src_page: ?*const Page = null,
+
         pub fn hash(self: *const @This(), link: PageEntry) u64 {
-            return link.hash(self.page.?.memory);
+            return link.hash((self.src_page orelse self.page.?).memory);
         }
 
         pub fn eql(self: *const @This(), a: PageEntry, b: PageEntry) bool {
-            return a.eql(self.page.?.memory, &b, self.page.?.memory);
+            return a.eql(
+                (self.src_page orelse self.page.?).memory,
+                &b,
+                self.page.?.memory,
+            );
         }
 
         pub fn deleted(self: *const @This(), link: PageEntry) void {
-            const page = self.page.?;
-            const alloc = &page.string_alloc;
-            switch (link.id) {
-                .implicit => {},
-                .explicit => |v| alloc.free(
-                    page.memory,
-                    v.offset.ptr(page.memory)[0..v.len],
-                ),
-            }
-            alloc.free(
-                page.memory,
-                link.uri.offset.ptr(page.memory)[0..link.uri.len],
-            );
+            link.free(self.page.?);
         }
     },
 );

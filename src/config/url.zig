@@ -25,9 +25,9 @@ const oni = @import("oniguruma");
 pub const regex =
     "(?:" ++ url_schemes ++
     \\)(?:
-++ ipv6_url_pattern ++
-    \\|[\w\-.~:/?#@!$&*+,;=%]+(?:[\(\[]\w*[\)\]])?)+(?<![,.])|(?:\.\.\/|\.\/*|\/)[\w\-.~:\/?#@!$&*+,;=%]+(?:\/[\w\-.~:\/?#@!$&*+,;=%]*)*
-;
+    ++ ipv6_url_pattern ++
+    \\|[\w\-.~:/?#@!$&*+,;=%]+(?:[\(\[]\w*[\)\]])?)+(?<![,.])|(?:\.\.\/|\.\/|\/)(?:(?=[\w\-.~:\/?#@!$&*+,;=%]*\.)[\w\-.~:\/?#@!$&*+,;=%]+(?: [\w\-.~:\/?#@!$&*+,;=%]*[\/.])*(?: +(?= *$))?|(?![\w\-.~:\/?#@!$&*+,;=%]*\.)[\w\-.~:\/?#@!$&*+,;=%]+(?: [\w\-.~:\/?#@!$&*+,;=%]+)*(?: +(?= *$))?)
+    ;
 const url_schemes =
     \\https?://|mailto:|ftp://|file:|ssh:|git://|ssh://|tel:|magnet:|ipfs://|ipns://|gemini://|gopher://|news:
 ;
@@ -112,6 +112,10 @@ test "url regex" {
             .input = "url with dashes [mode 2027](https://github.com/contour-terminal/terminal-unicode-core) for better unicode support",
             .expect = "https://github.com/contour-terminal/terminal-unicode-core",
         },
+        .{
+            .input = "dot.http://example.com",
+            .expect = "http://example.com",
+        },
         // weird characters in URL
         .{
             .input = "weird characters https://example.com/~user/?query=1&other=2#hash and more",
@@ -190,7 +194,7 @@ test "url regex" {
         },
         .{
             .input = "../example.py ",
-            .expect = "../example.py",
+            .expect = "../example.py ",
         },
         .{
             .input = "first time ../example.py contributor ",
@@ -248,6 +252,23 @@ test "url regex" {
         .{
             .input = "IPv6 in markdown [link](http://[2001:db8::1]/docs)",
             .expect = "http://[2001:db8::1]/docs",
+        },
+        // File paths with spaces
+        .{
+            .input = "./spaces-end.   ",
+            .expect = "./spaces-end.   ",
+        },
+        .{
+            .input = "./space middle",
+            .expect = "./space middle",
+        },
+        .{
+            .input = "../test folder/file.txt",
+            .expect = "../test folder/file.txt",
+        },
+        .{
+            .input = "/tmp/test folder/file.txt",
+            .expect = "/tmp/test folder/file.txt",
         },
     };
 

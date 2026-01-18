@@ -1,11 +1,10 @@
 const std = @import("std");
-const inputpkg = @import("../input.zig");
 const args = @import("args.zig");
-const Action = @import("action.zig").Action;
+const Action = @import("ghostty.zig").Action;
 const Config = @import("../config/Config.zig");
+const configpkg = @import("../config.zig");
 const themepkg = @import("../config/theme.zig");
 const tui = @import("tui.zig");
-const internal_os = @import("../os/main.zig");
 const global_state = &@import("../global.zig").state;
 
 const vaxis = @import("vaxis");
@@ -17,12 +16,17 @@ const zf = @import("zf");
 // scroll position for larger lists.
 const SMALL_LIST_THRESHOLD = 10;
 
+const ColorScheme = enum { all, dark, light };
+
 pub const Options = struct {
     /// If true, print the full path to the theme.
     path: bool = false,
 
     /// If true, force a plain list of themes.
     plain: bool = false,
+
+    /// Specifies the color scheme of the themes to include in the list.
+    color: ColorScheme = .all,
 
     pub fn deinit(self: Options) void {
         _ = self;
@@ -52,9 +56,12 @@ const ThemeListElement = struct {
             .host = .{ .raw = "" },
             .path = .{ .raw = self.path },
         };
-        var buf = std.ArrayList(u8).init(alloc);
+        var buf: std.Io.Writer.Allocating = .init(alloc);
         errdefer buf.deinit();
-        try uri.writeToStream(.{ .scheme = true, .authority = true, .path = true }, buf.writer());
+        try uri.writeToStream(
+            &buf.writer,
+            .{ .scheme = true, .authority = true, .path = true },
+        );
         return buf.toOwnedSlice();
     }
 };
@@ -74,7 +81,7 @@ const ThemeListElement = struct {
 /// Two different directories will be searched for themes.
 ///
 /// The first directory is the `themes` subdirectory of your Ghostty
-/// configuration directory. This is `$XDG_CONFIG_DIR/ghostty/themes` or
+/// configuration directory. This is `$XDG_CONFIG_HOME/ghostty/themes` or
 /// `~/.config/ghostty/themes`.
 ///
 /// The second directory is the `themes` subdirectory of the Ghostty resources
@@ -93,6 +100,9 @@ const ThemeListElement = struct {
 ///   * `--path`: Show the full path to the theme.
 ///
 ///   * `--plain`: Force a plain listing of themes.
+///
+///   * `--color`: Specify the color scheme of the themes included in the list.
+///                This can be `dark`, `light`, or `all`. The default is `all`.
 pub fn run(gpa_alloc: std.mem.Allocator) !u8 {
     var opts: Options = .{};
     defer opts.deinit();
@@ -106,18 +116,25 @@ pub fn run(gpa_alloc: std.mem.Allocator) !u8 {
     var arena = std.heap.ArenaAllocator.init(gpa_alloc);
     const alloc = arena.allocator();
 
-    const stderr = std.io.getStdErr().writer();
-    const stdout = std.io.getStdOut().writer();
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_file: std.fs.File = .stdout();
+    var stdout_writer = stdout_file.writer(&stdout_buf);
+    const stdout = &stdout_writer.interface;
 
-    if (global_state.resources_dir == null)
+    var stderr_buf: [4096]u8 = undefined;
+    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    const stderr = &stderr_writer.interface;
+
+    const resources_dir = global_state.resources_dir.app();
+    if (resources_dir == null)
         try stderr.print("Could not find the Ghostty resources directory. Please ensure " ++
             "that Ghostty is installed correctly.\n", .{});
 
     var count: usize = 0;
 
-    var themes = std.ArrayList(ThemeListElement).init(alloc);
+    var themes: std.ArrayList(ThemeListElement) = .empty;
 
-    var it = themepkg.LocationIterator{ .arena_alloc = arena.allocator() };
+    var it: themepkg.LocationIterator = .{ .arena_alloc = arena.allocator() };
 
     while (try it.next()) |loc| {
         var dir = std.fs.cwd().openDir(loc.dir, .{ .iterate = true }) catch |err| switch (err) {
@@ -137,9 +154,11 @@ pub fn run(gpa_alloc: std.mem.Allocator) !u8 {
                     if (std.mem.eql(u8, entry.name, ".DS_Store"))
                         continue;
                     count += 1;
-                    try themes.append(.{
+
+                    const path = try std.fs.path.join(alloc, &.{ loc.dir, entry.name });
+                    try themes.append(alloc, .{
+                        .path = path,
                         .location = loc.location,
-                        .path = try std.fs.path.join(alloc, &.{ loc.dir, entry.name }),
                         .theme = try alloc.dupe(u8, entry.name),
                     });
                 },
@@ -155,19 +174,52 @@ pub fn run(gpa_alloc: std.mem.Allocator) !u8 {
 
     std.mem.sortUnstable(ThemeListElement, themes.items, {}, ThemeListElement.lessThan);
 
-    if (tui.can_pretty_print and !opts.plain and std.posix.isatty(std.io.getStdOut().handle)) {
-        try preview(gpa_alloc, themes.items);
+    if (tui.can_pretty_print and !opts.plain and stdout_file.isTty()) {
+        try preview(gpa_alloc, themes.items, opts.color);
         return 0;
     }
 
+    var theme_config = try Config.default(gpa_alloc);
+    defer theme_config.deinit();
     for (themes.items) |theme| {
+        try theme_config.loadFile(theme_config._arena.?.allocator(), theme.path);
+        if (!shouldIncludeTheme(opts.color, theme_config)) {
+            continue;
+        }
         if (opts.path)
-            try stdout.print("{s} ({s}) {s}\n", .{ theme.theme, @tagName(theme.location), theme.path })
+            try stdout.print("{s} ({t}) {s}\n", .{ theme.theme, theme.location, theme.path })
         else
-            try stdout.print("{s} ({s})\n", .{ theme.theme, @tagName(theme.location) });
+            try stdout.print("{s} ({t})\n", .{ theme.theme, theme.location });
     }
 
+    // Don't forget to flush!
+    try stdout.flush();
     return 0;
+}
+
+fn resolveAutoThemePath(alloc: std.mem.Allocator) ![]u8 {
+    const main_cfg_path = try configpkg.preferredDefaultFilePath(alloc);
+    defer alloc.free(main_cfg_path);
+
+    const base_dir = std.fs.path.dirname(main_cfg_path) orelse return error.BadPathName;
+    return try std.fs.path.join(alloc, &.{ base_dir, "auto", "theme.ghostty" });
+}
+
+fn writeAutoThemeFile(alloc: std.mem.Allocator, theme_name: []const u8) !void {
+    const auto_path = try resolveAutoThemePath(alloc);
+    defer alloc.free(auto_path);
+
+    if (std.fs.path.dirname(auto_path)) |dir| {
+        try std.fs.cwd().makePath(dir);
+    }
+
+    var f = try std.fs.createFileAbsolute(auto_path, .{ .truncate = true });
+    defer f.close();
+
+    var buf: [128]u8 = undefined;
+    var w = f.writer(&buf);
+    try w.interface.print("theme = {s}\n", .{theme_name});
+    try w.interface.flush();
 }
 
 const Event = union(enum) {
@@ -192,41 +244,47 @@ const Preview = struct {
         normal,
         help,
         search,
+        save,
     },
     color_scheme: vaxis.Color.Scheme,
     text_input: vaxis.widgets.TextInput,
+    theme_filter: ColorScheme,
 
-    pub fn init(allocator: std.mem.Allocator, themes: []ThemeListElement) !*Preview {
+    pub fn init(
+        allocator: std.mem.Allocator,
+        themes: []ThemeListElement,
+        theme_filter: ColorScheme,
+        buf: []u8,
+    ) !*Preview {
         const self = try allocator.create(Preview);
 
         self.* = .{
             .allocator = allocator,
             .should_quit = false,
-            .tty = try vaxis.Tty.init(),
+            .tty = try .init(buf),
             .vx = try vaxis.init(allocator, .{}),
             .mouse = null,
             .themes = themes,
-            .filtered = try std.ArrayList(usize).initCapacity(allocator, themes.len),
+            .filtered = try .initCapacity(allocator, themes.len),
             .current = 0,
             .window = 0,
             .hex = false,
             .mode = .normal,
             .color_scheme = .light,
-            .text_input = vaxis.widgets.TextInput.init(allocator, &self.vx.unicode),
+            .text_input = .init(allocator),
+            .theme_filter = theme_filter,
         };
 
-        for (0..themes.len) |i| {
-            try self.filtered.append(i);
-        }
+        try self.updateFiltered();
 
         return self;
     }
 
     pub fn deinit(self: *Preview) void {
         const allocator = self.allocator;
-        self.filtered.deinit();
+        self.filtered.deinit(allocator);
         self.text_input.deinit();
-        self.vx.deinit(allocator, self.tty.anyWriter());
+        self.vx.deinit(allocator, self.tty.writer());
         self.tty.deinit();
         allocator.destroy(self);
     }
@@ -239,12 +297,14 @@ const Preview = struct {
         try loop.init();
         try loop.start();
 
-        try self.vx.enterAltScreen(self.tty.anyWriter());
-        try self.vx.setTitle(self.tty.anyWriter(), "👻 Ghostty Theme Preview 👻");
-        try self.vx.queryTerminal(self.tty.anyWriter(), 1 * std.time.ns_per_s);
-        try self.vx.setMouseMode(self.tty.anyWriter(), true);
+        const writer = self.tty.writer();
+
+        try self.vx.enterAltScreen(writer);
+        try self.vx.setTitle(writer, "👻 Ghostty Theme Preview 👻");
+        try self.vx.queryTerminal(writer, 1 * std.time.ns_per_s);
+        try self.vx.setMouseMode(writer, true);
         if (self.vx.caps.color_scheme_updates)
-            try self.vx.subscribeToColorSchemeUpdates(self.tty.anyWriter());
+            try self.vx.subscribeToColorSchemeUpdates(writer);
 
         while (!self.should_quit) {
             var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -257,9 +317,8 @@ const Preview = struct {
             }
             try self.draw(alloc);
 
-            var buffered = self.tty.bufferedWriter();
-            try self.vx.render(buffered.writer().any());
-            try buffered.flush();
+            try self.vx.render(writer);
+            try writer.flush();
         }
     }
 
@@ -281,6 +340,8 @@ const Preview = struct {
 
         self.filtered.clearRetainingCapacity();
 
+        var theme_config = try Config.default(self.allocator);
+        defer theme_config.deinit();
         if (self.text_input.buf.realLength() > 0) {
             const first_half = self.text_input.buf.firstHalf();
             const second_half = self.text_input.buf.secondHalf();
@@ -294,23 +355,29 @@ const Preview = struct {
             const string = try std.ascii.allocLowerString(self.allocator, buffer);
             defer self.allocator.free(string);
 
-            var tokens = std.ArrayList([]const u8).init(self.allocator);
-            defer tokens.deinit();
+            var tokens: std.ArrayList([]const u8) = .empty;
+            defer tokens.deinit(self.allocator);
 
             var it = std.mem.tokenizeScalar(u8, string, ' ');
-            while (it.next()) |token| try tokens.append(token);
+            while (it.next()) |token| try tokens.append(self.allocator, token);
 
             for (self.themes, 0..) |*theme, i| {
+                try theme_config.loadFile(theme_config._arena.?.allocator(), theme.path);
+                if (!shouldIncludeTheme(self.theme_filter, theme_config)) continue;
+
                 theme.rank = zf.rank(theme.theme, tokens.items, .{
                     .to_lower = true,
                     .plain = true,
                 });
-                if (theme.rank != null) try self.filtered.append(i);
+                if (theme.rank != null) try self.filtered.append(self.allocator, i);
             }
         } else {
             for (self.themes, 0..) |*theme, i| {
-                try self.filtered.append(i);
-                theme.rank = null;
+                try theme_config.loadFile(theme_config._arena.?.allocator(), theme.path);
+                if (shouldIncludeTheme(self.theme_filter, theme_config)) {
+                    try self.filtered.append(self.allocator, i);
+                    theme.rank = null;
+                }
             }
         }
 
@@ -377,6 +444,8 @@ const Preview = struct {
                             self.mode = .help;
                         if (key.matches('/', .{}))
                             self.mode = .search;
+                        if (key.matchesAny(&.{ vaxis.Key.enter, vaxis.Key.kp_enter }, .{}))
+                            self.mode = .save;
                         if (key.matchesAny(&.{ 'x', '/' }, .{ .ctrl = true })) {
                             self.text_input.buf.clearRetainingCapacity();
                             try self.updateFiltered();
@@ -399,16 +468,24 @@ const Preview = struct {
                             self.hex = false;
                         if (key.matches('c', .{}))
                             try self.vx.copyToSystemClipboard(
-                                self.tty.anyWriter(),
+                                self.tty.writer(),
                                 self.themes[self.filtered.items[self.current]].theme,
                                 alloc,
                             )
                         else if (key.matches('c', .{ .shift = true }))
                             try self.vx.copyToSystemClipboard(
-                                self.tty.anyWriter(),
+                                self.tty.writer(),
                                 self.themes[self.filtered.items[self.current]].path,
                                 alloc,
                             );
+                        if (key.matches('f', .{})) {
+                            switch (self.theme_filter) {
+                                .all => self.theme_filter = .dark,
+                                .dark => self.theme_filter = .light,
+                                .light => self.theme_filter = .all,
+                            }
+                            try self.updateFiltered();
+                        }
                     },
                     .help => {
                         if (key.matches('q', .{}))
@@ -431,11 +508,20 @@ const Preview = struct {
                         try self.text_input.update(.{ .key_press = key });
                         try self.updateFiltered();
                     },
+                    .save => {
+                        if (key.matches('q', .{}))
+                            self.should_quit = true;
+                        if (key.matchesAny(&.{ vaxis.Key.escape, vaxis.Key.enter, vaxis.Key.kp_enter }, .{}))
+                            self.mode = .normal;
+                        if (key.matches('w', .{})) {
+                            self.saveSelectedTheme();
+                        }
+                    },
                 }
             },
             .color_scheme => |color_scheme| self.color_scheme = color_scheme,
             .mouse => |mouse| self.mouse = mouse,
-            .winsize => |ws| try self.vx.resize(self.allocator, self.tty.anyWriter(), ws),
+            .winsize => |ws| try self.vx.resize(self.allocator, self.tty.writer(), ws),
         }
     }
 
@@ -641,7 +727,7 @@ const Preview = struct {
             .help => {
                 win.hideCursor();
                 const width = 60;
-                const height = 20;
+                const height = 22;
                 const child = win.child(
                     .{
                         .x_off = win.width / 2 -| width / 2,
@@ -660,6 +746,7 @@ const Preview = struct {
                 const key_help = [_]struct { keys: []const u8, help: []const u8 }{
                     .{ .keys = "^C, q, ESC", .help = "Quit." },
                     .{ .keys = "F1, ?, ^H", .help = "Toggle help window." },
+                    .{ .keys = "f", .help = "Cycle through theme filters." },
                     .{ .keys = "k, ↑", .help = "Move up 1 theme." },
                     .{ .keys = "ScrollUp", .help = "Move up 1 theme." },
                     .{ .keys = "PgUp", .help = "Move up 20 themes." },
@@ -674,7 +761,8 @@ const Preview = struct {
                     .{ .keys = "End", .help = "Go to the end of the list." },
                     .{ .keys = "/", .help = "Start search." },
                     .{ .keys = "^X, ^/", .help = "Clear search." },
-                    .{ .keys = "⏎", .help = "Close search window." },
+                    .{ .keys = "⏎", .help = "Save theme or close search window." },
+                    .{ .keys = "w", .help = "Write theme to auto config file." },
                 };
 
                 for (key_help, 0..) |help, captured_i| {
@@ -724,6 +812,57 @@ const Preview = struct {
                 });
                 child.fill(.{ .style = self.ui_standard() });
                 self.text_input.drawWithStyle(child, self.ui_standard());
+            },
+            .save => {
+                const theme = self.themes[self.filtered.items[self.current]];
+
+                const width = 92;
+                const height = 17;
+                const child = win.child(
+                    .{
+                        .x_off = win.width / 2 -| width / 2,
+                        .y_off = win.height / 2 -| height / 2,
+                        .width = width,
+                        .height = height,
+                        .border = .{
+                            .where = .all,
+                            .style = self.ui_standard(),
+                        },
+                    },
+                );
+
+                child.fill(.{ .style = self.ui_standard() });
+
+                const save_instructions = [_][]const u8{
+                    "To apply this theme, add the following line to your Ghostty configuration:",
+                    "",
+                    try std.fmt.allocPrint(alloc, "theme = {s}", .{theme.theme}),
+                    "",
+                    "Save the configuration file and then reload it to apply the new theme.",
+                    "",
+                    "Or press 'w' to write an auto theme file to your system's preferred default config path.",
+                    "Then add the following line to your Ghostty configuration and reload:",
+                    "",
+                    "config-file = ?auto/theme.ghostty",
+                    "",
+                    "For more details on configuration and themes, visit the Ghostty documentation:",
+                    "",
+                    "https://ghostty.org/docs/config/reference",
+                };
+
+                for (save_instructions, 0..) |instruction, captured_i| {
+                    const i: u16 = @intCast(captured_i);
+                    _ = child.printSegment(
+                        .{
+                            .text = instruction,
+                            .style = self.ui_standard(),
+                        },
+                        .{
+                            .row_offset = i + 1,
+                            .col_offset = 2,
+                        },
+                    );
+                }
             },
         }
     }
@@ -812,6 +951,42 @@ const Preview = struct {
                     config.background.g,
                     config.background.b,
                 },
+            };
+            const cursor_fg: vaxis.Color = if (config.@"cursor-text") |cursor_text| .{
+                .rgb = [_]u8{
+                    cursor_text.color.r,
+                    cursor_text.color.g,
+                    cursor_text.color.b,
+                },
+            } else bg;
+            const cursor_bg: vaxis.Color = if (config.@"cursor-color") |cursor_bg| .{
+                .rgb = [_]u8{
+                    cursor_bg.color.r,
+                    cursor_bg.color.g,
+                    cursor_bg.color.b,
+                },
+            } else fg;
+            const selection_fg: vaxis.Color = if (config.@"selection-foreground") |selection_fg| .{
+                .rgb = [_]u8{
+                    selection_fg.color.r,
+                    selection_fg.color.g,
+                    selection_fg.color.b,
+                },
+            } else bg;
+            const selection_bg: vaxis.Color = if (config.@"selection-background") |selection_bg| .{
+                .rgb = [_]u8{
+                    selection_bg.color.r,
+                    selection_bg.color.g,
+                    selection_bg.color.b,
+                },
+            } else fg;
+            const cursor: vaxis.Style = .{
+                .fg = cursor_fg,
+                .bg = cursor_bg,
+            };
+            const standard_selection: vaxis.Style = .{
+                .fg = selection_fg,
+                .bg = selection_bg,
             };
             const standard: vaxis.Style = .{
                 .fg = fg,
@@ -926,14 +1101,14 @@ const Preview = struct {
                     );
                 }
 
-                var buf = std.ArrayList(u8).init(alloc);
+                var buf: std.Io.Writer.Allocating = .init(alloc);
                 defer buf.deinit();
                 for (config._diagnostics.items(), 0..) |diag, captured_i| {
                     const i: u16 = @intCast(captured_i);
-                    try diag.write(buf.writer());
+                    try diag.format(&buf.writer);
                     _ = child.printSegment(
                         .{
-                            .text = buf.items,
+                            .text = buf.written(),
                             .style = self.ui_err(),
                         },
                         .{
@@ -1201,7 +1376,7 @@ const Preview = struct {
                         .{ .text = "const ", .style = color5 },
                         .{ .text = "stdout ", .style = standard },
                         .{ .text = "=", .style = color5 },
-                        .{ .text = " std.io.getStdOut().writer();", .style = standard },
+                        .{ .text = " std.Io.getStdOut().writer();", .style = standard },
                     },
                     .{
                         .row_offset = 7,
@@ -1351,11 +1526,8 @@ const Preview = struct {
                     &.{
                         .{ .text = "  14   │             ", .style = color238 },
                         .{ .text = "try ", .style = color5 },
-                        .{ .text = "stdout.print(", .style = standard },
-                        .{ .text = "\"{d}", .style = color10 },
-                        .{ .text = "\\n", .style = color12 },
-                        .{ .text = "\"", .style = color10 },
-                        .{ .text = ", .{i});", .style = standard },
+                        .{ .text = "stdout.print(\"{d}\\n\", .{i})", .style = standard_selection },
+                        .{ .text = ";", .style = cursor },
                     },
                     .{
                         .row_offset = 17,
@@ -1521,6 +1693,18 @@ const Preview = struct {
             });
         }
     }
+
+    fn saveSelectedTheme(self: *Preview) void {
+        if (self.filtered.items.len == 0)
+            return;
+
+        const idx = self.filtered.items[self.current];
+        const theme = self.themes[idx];
+
+        writeAutoThemeFile(self.allocator, theme.theme) catch {
+            return;
+        };
+    }
 };
 
 fn color(config: Config, palette: usize) vaxis.Color {
@@ -1535,8 +1719,23 @@ fn color(config: Config, palette: usize) vaxis.Color {
 
 const lorem_ipsum = @embedFile("lorem_ipsum.txt");
 
-fn preview(allocator: std.mem.Allocator, themes: []ThemeListElement) !void {
-    var app = try Preview.init(allocator, themes);
+fn preview(allocator: std.mem.Allocator, themes: []ThemeListElement, theme_filter: ColorScheme) !void {
+    var buf: [4096]u8 = undefined;
+    var app = try Preview.init(
+        allocator,
+        themes,
+        theme_filter,
+        &buf,
+    );
     defer app.deinit();
     try app.run();
+}
+
+fn shouldIncludeTheme(theme_filter: ColorScheme, theme_config: Config) bool {
+    const rf = @as(f32, @floatFromInt(theme_config.background.r)) / 255.0;
+    const gf = @as(f32, @floatFromInt(theme_config.background.g)) / 255.0;
+    const bf = @as(f32, @floatFromInt(theme_config.background.b)) / 255.0;
+    const luminance = 0.2126 * rf + 0.7152 * gf + 0.0722 * bf;
+    const is_dark = luminance < 0.5;
+    return (theme_filter == .all) or (theme_filter == .dark and is_dark) or (theme_filter == .light and !is_dark);
 }

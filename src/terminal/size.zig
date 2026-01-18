@@ -1,5 +1,5 @@
 const std = @import("std");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
 
 /// The maximum size of a page in bytes. We use a u16 here because any
 /// smaller bit size by Zig is upgraded anyways to a u16 on mainstream
@@ -11,9 +11,32 @@ pub const max_page_size = std.math.maxInt(u32);
 /// derived from the maximum terminal page size.
 pub const OffsetInt = std.math.IntFittingRange(0, max_page_size - 1);
 
-/// The int type that can contain the maximum number of cells in a page.
-pub const CellCountInt = u16; // TODO: derive
+/// Int types for maximum values of things. A lot of these sizes are
+/// based on "X is enough for any reasonable use case" principles.
+// The goal is that a user can have the maxInt amount of all of these
+// present at one time and be able to address them in a single Page.zig.
+
+// Total number of cells that are possible in each dimension (row/col).
+// Based on 2^16 being enough for any reasonable terminal size and allowing
+// IDs to remain 16-bit.
+pub const CellCountInt = u16;
+
+// Total number of styles and hyperlinks that are possible in a page.
+// We match CellCountInt here because each cell in a single row can have at
+// most one style, making it simple to split a page by splitting rows.
 //
+// Note due to the way RefCountedSet works, we are short one value, but
+// this is a theoretical limit we accept. A page with a single row max
+// columns wide would be one short of having every cell have a unique style.
+pub const StyleCountInt = CellCountInt;
+pub const HyperlinkCountInt = CellCountInt;
+
+// Total number of bytes that can be taken up by grapheme data and string
+// data. Both of these technically unlimited with malicious input, but
+// we choose a reasonable limit of 2^32 (4GB) per.
+pub const GraphemeBytesInt = u32;
+pub const StringBytesInt = u32;
+
 /// The offset from the base address of the page to the start of some data.
 /// This is typed for ease of use.
 ///
@@ -28,10 +51,15 @@ pub fn Offset(comptime T: type) type {
         pub const Slice = struct {
             offset: Self = .{},
             len: usize = 0,
+
+            /// Returns a slice for the data, properly typed.
+            pub inline fn slice(self: Slice, base: anytype) []T {
+                return self.offset.ptr(base)[0..self.len];
+            }
         };
 
         /// Returns a pointer to the start of the data, properly typed.
-        pub fn ptr(self: Self, base: anytype) [*]T {
+        pub inline fn ptr(self: Self, base: anytype) [*]T {
             // The offset must be properly aligned for the type since
             // our return type is naturally aligned. We COULD modify this
             // to return arbitrary alignment, but its not something we need.
@@ -118,7 +146,7 @@ pub const OffsetBuf = struct {
 
 /// Get the offset for a given type from some base pointer to the
 /// actual pointer to the type.
-pub fn getOffset(
+pub inline fn getOffset(
     comptime T: type,
     base: anytype,
     ptr: *const T,
@@ -129,16 +157,16 @@ pub fn getOffset(
     return .{ .offset = @intCast(offset) };
 }
 
-fn intFromBase(base: anytype) usize {
+inline fn intFromBase(base: anytype) usize {
     const T = @TypeOf(base);
     return switch (@typeInfo(T)) {
-        .Pointer => |v| switch (v.size) {
-            .One,
-            .Many,
-            .C,
+        .pointer => |v| switch (v.size) {
+            .one,
+            .many,
+            .c,
             => @intFromPtr(base),
 
-            .Slice => @intFromPtr(base.ptr),
+            .slice => @intFromPtr(base.ptr),
         },
 
         else => switch (T) {

@@ -13,8 +13,8 @@ pub threadlocal var context: Context = undefined;
 /// The getProcAddress param is an anytype so that we can accept multiple
 /// forms of the function depending on what we're interfacing with.
 pub fn load(getProcAddress: anytype) !c_int {
-    const GlProc = *const fn () callconv(.C) void;
-    const GlfwFn = *const fn ([*:0]const u8) callconv(.C) ?GlProc;
+    const GlProc = *const fn () callconv(.c) void;
+    const GlfwFn = *const fn ([*:0]const u8) callconv(.c) ?GlProc;
 
     const res = switch (@TypeOf(getProcAddress)) {
         // glfw
@@ -25,7 +25,7 @@ pub fn load(getProcAddress: anytype) !c_int {
         @TypeOf(null) => c.gladLoaderLoadGLContext(&context),
 
         // try as-is. If this introduces a compiler error, then add a new case.
-        else => c.gladLoadGLContext(&context, getProcAddress),
+        else => c.gladLoadGLContext(&context, @ptrCast(getProcAddress)),
     };
     if (res == 0) return error.GLInitFailed;
     return res;

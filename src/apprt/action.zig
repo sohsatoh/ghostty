@@ -1,5 +1,6 @@
 const std = @import("std");
-const assert = std.debug.assert;
+const build_config = @import("../build_config.zig");
+const assert = @import("../quirks.zig").inlineAssert;
 const apprt = @import("../apprt.zig");
 const configpkg = @import("../config.zig");
 const input = @import("../input.zig");
@@ -82,8 +83,9 @@ pub const Action = union(Key) {
     /// the tab should be opened in a new window.
     new_tab,
 
-    /// Closes the tab belonging to the currently focused split.
-    close_tab,
+    /// Closes the tab belonging to the currently focused split, or all other
+    /// tabs, depending on the mode.
+    close_tab: CloseTabMode,
 
     /// Create a new split. The value determines the location of the split
     /// relative to the target.
@@ -107,8 +109,16 @@ pub const Action = union(Key) {
     /// Toggle the quick terminal in or out.
     toggle_quick_terminal,
 
+    /// Toggle the command palette. This currently only works on macOS.
+    toggle_command_palette,
+
     /// Toggle the visibility of all Ghostty terminal windows.
     toggle_visibility,
+
+    /// Toggle the window background opacity. This only has an effect
+    /// if the window started as transparent (non-opaque), and toggles
+    /// it between fully opaque and the configured background opacity.
+    toggle_background_opacity,
 
     /// Moves a tab by a relative offset.
     ///
@@ -123,6 +133,9 @@ pub const Action = union(Key) {
 
     /// Jump to a specific split.
     goto_split: GotoSplit,
+
+    /// Jump to next/previous window.
+    goto_window: GotoWindow,
 
     /// Resize the split in the given direction.
     resize_split: ResizeSplit,
@@ -140,16 +153,38 @@ pub const Action = union(Key) {
     /// Sets a size limit (in pixels) for the target terminal.
     size_limit: SizeLimit,
 
-    /// Specifies the initial size of the target terminal. This will be
-    /// sent only during the initialization of a surface. If it is received
-    /// after the surface is initialized it should be ignored.
+    /// Resets the window size to the default size. See the
+    /// `reset_window_size` keybinding for more information.
+    reset_window_size,
+
+    /// Specifies the initial size of the target terminal.
+    ///
+    /// This may be sent once during the initialization of a surface
+    /// (as part of the init call) to indicate the initial size requested
+    /// for the window if it is not maximized or fullscreen.
+    ///
+    /// This may also be sent at any time after the surface is initialized
+    /// to note the new "default size" of the window. This should in general
+    /// be ignored, but may be useful if the apprt wants to support
+    /// a "return to default size" action.
     initial_size: InitialSize,
 
     /// The cell size has changed to the given dimensions in pixels.
     cell_size: CellSize,
 
+    /// The scrollbar is updating.
+    scrollbar: terminal.Scrollbar,
+
+    /// The target should be re-rendered. This usually has a specific
+    /// surface target but if the app is targeted then all active
+    /// surfaces should be redrawn.
+    render,
+
     /// Control whether the inspector is shown or hidden.
     inspector: Inspector,
+
+    /// Show the GTK inspector.
+    show_gtk_inspector,
 
     /// The inspector for the given target has changes and should be
     /// rendered at the next opportunity.
@@ -158,8 +193,13 @@ pub const Action = union(Key) {
     /// Show a desktop notification.
     desktop_notification: DesktopNotification,
 
-    /// Set the title of the target.
+    /// Set the title of the target to the requested value.
     set_title: SetTitle,
+
+    /// Set the title of the target to a prompted value. It is up to
+    /// the apprt to prompt. The value specifies whether to prompt for the
+    /// surface title or the tab title.
+    prompt_title: PromptTitle,
 
     /// The current working directory has changed for the target terminal.
     pwd: Pwd,
@@ -182,10 +222,21 @@ pub const Action = union(Key) {
     open_config,
 
     /// Called when there are no more surfaces and the app should quit
-    /// after the configured delay. This can be cancelled by sending
-    /// another quit_timer action with "stop". Multiple "starts" shouldn't
-    /// happen and can be ignored or cause a restart it isn't that important.
+    /// after the configured delay.
+    ///
+    /// Despite the name, this is the notification that libghostty sends
+    /// when there are no more surfaces regardless of if the configuration
+    /// wants to quit after close, has any delay set, etc. It's up to the
+    /// apprt to implement the proper logic based on the config.
+    ///
+    /// This can be cancelled by sending another quit_timer action with "stop".
+    /// Multiple "starts" shouldn't happen and can be ignored or cause a
+    /// restart it isn't that important.
     quit_timer: QuitTimer,
+
+    /// Set the window floating state. A floating window is one that is
+    /// always on top of other windows even when not focused.
+    float_window: FloatWindow,
 
     /// Set the secure input functionality on or off. "Secure input" means
     /// that the user is currently at some sort of prompt where they may be
@@ -198,6 +249,9 @@ pub const Action = union(Key) {
     /// The UI should show some indication that the user is in a sequenced
     /// key mode because other input may be ignored.
     key_sequence: KeySequence,
+
+    /// A key table has been activated or deactivated.
+    key_table: KeyTable,
 
     /// A terminal color was changed programmatically through things
     /// such as OSC 10/11.
@@ -226,6 +280,56 @@ pub const Action = union(Key) {
     /// for changes.
     config_change: ConfigChange,
 
+    /// Closes the currently focused window.
+    close_window,
+
+    /// Called when the bell character is seen. The apprt should do whatever
+    /// it needs to ring the bell. This is usually a sound or visual effect.
+    ring_bell,
+
+    /// Undo the last action. See the "undo" keybinding for more
+    /// details on what can and cannot be undone.
+    undo,
+
+    /// Redo the last undone action.
+    redo,
+
+    check_for_updates,
+
+    /// Open a URL using the native OS mechanisms. On macOS this might be `open`
+    /// or on Linux this might be `xdg-open`. The exact mechanism is up to the
+    /// apprt.
+    open_url: OpenUrl,
+
+    /// Show a native GUI notification that the child process has exited.
+    show_child_exited: apprt.surface.Message.ChildExited,
+
+    /// Show a native GUI notification about the progress of some TUI operation.
+    progress_report: terminal.osc.Command.ProgressReport,
+
+    /// Show the on-screen keyboard.
+    show_on_screen_keyboard,
+
+    /// A command has finished,
+    command_finished: CommandFinished,
+
+    /// Start the search overlay with an optional initial needle. If the
+    /// search is already active and the needle is non-empty, update the
+    /// current search needle and focus the search input.
+    start_search: StartSearch,
+
+    /// End the search overlay, clearing the search state and hiding it.
+    end_search,
+
+    /// The total number of matches found by the search.
+    search_total: SearchTotal,
+
+    /// The currently selected search match index (1-based).
+    search_selected: SearchSelected,
+
+    /// The readonly state of the surface has changed.
+    readonly: Readonly,
+
     /// Sync with: ghostty_action_tag_e
     pub const Key = enum(c_int) {
         quit,
@@ -239,21 +343,29 @@ pub const Action = union(Key) {
         toggle_tab_overview,
         toggle_window_decorations,
         toggle_quick_terminal,
+        toggle_command_palette,
         toggle_visibility,
+        toggle_background_opacity,
         move_tab,
         goto_tab,
         goto_split,
+        goto_window,
         resize_split,
         equalize_splits,
         toggle_split_zoom,
         present_terminal,
         size_limit,
+        reset_window_size,
         initial_size,
         cell_size,
+        scrollbar,
+        render,
         inspector,
+        show_gtk_inspector,
         render_inspector,
         desktop_notification,
         set_title,
+        prompt_title,
         pwd,
         mouse_shape,
         mouse_visibility,
@@ -261,16 +373,33 @@ pub const Action = union(Key) {
         renderer_health,
         open_config,
         quit_timer,
+        float_window,
         secure_input,
         key_sequence,
+        key_table,
         color_change,
         reload_config,
         config_change,
+        close_window,
+        ring_bell,
+        undo,
+        redo,
+        check_for_updates,
+        open_url,
+        show_child_exited,
+        progress_report,
+        show_on_screen_keyboard,
+        command_finished,
+        start_search,
+        end_search,
+        search_total,
+        search_selected,
+        readonly,
     };
 
     /// Sync with: ghostty_action_u
     pub const CValue = cvalue: {
-        const key_fields = @typeInfo(Key).Enum.fields;
+        const key_fields = @typeInfo(Key).@"enum".fields;
         var union_fields: [key_fields.len]std.builtin.Type.UnionField = undefined;
         for (key_fields, 0..) |field, i| {
             const action = @unionInit(Action, field.name, undefined);
@@ -288,9 +417,9 @@ pub const Action = union(Key) {
             };
         }
 
-        break :cvalue @Type(.{ .Union = .{
+        break :cvalue @Type(.{ .@"union" = .{
             .layout = .@"extern",
-            .tag_type = Key,
+            .tag_type = null,
             .fields = &union_fields,
             .decls = &.{},
         } });
@@ -302,9 +431,20 @@ pub const Action = union(Key) {
         value: CValue,
     };
 
+    comptime {
+        // For ABI compatibility, we expect that this is our union size.
+        // At the time of writing, we don't promise ABI compatibility
+        // so we can change this but I want to be aware of it.
+        assert(@sizeOf(CValue) == switch (@sizeOf(usize)) {
+            4 => 16,
+            8 => 24,
+            else => unreachable,
+        });
+    }
+
     /// Returns the value type for the given key.
     pub fn Value(comptime key: Key) type {
-        inline for (@typeInfo(Action).Union.fields) |field| {
+        inline for (@typeInfo(Action).@"union".fields) |field| {
             const field_key = @field(Key, field.name);
             if (field_key == key) return field.type;
         }
@@ -350,6 +490,13 @@ pub const GotoSplit = enum(c_int) {
     right,
 };
 
+// This is made extern (c_int) to make interop easier with our embedded
+// runtime. The small size cost doesn't make a difference in our union.
+pub const GotoWindow = enum(c_int) {
+    previous,
+    next,
+};
+
 /// The amount to resize the split by and the direction to resize it in.
 pub const ResizeSplit = extern struct {
     amount: u16,
@@ -385,6 +532,13 @@ pub const Fullscreen = enum(c_int) {
     /// window. This is much faster to enter and exit than the native mode.
     macos_non_native,
     macos_non_native_visible_menu,
+    macos_non_native_padded_notch,
+};
+
+pub const FloatWindow = enum(c_int) {
+    on,
+    off,
+    toggle,
 };
 
 pub const SecureInput = enum(c_int) {
@@ -405,13 +559,24 @@ pub const QuitTimer = enum(c_int) {
     stop,
 };
 
+pub const Readonly = enum(c_int) {
+    off,
+    on,
+};
+
 pub const MouseVisibility = enum(c_int) {
     visible,
     hidden,
 };
 
+/// Whether to prompt for the surface title or tab title.
+pub const PromptTitle = enum(c_int) {
+    surface,
+    tab,
+};
+
 pub const MouseOverLink = struct {
-    url: []const u8,
+    url: [:0]const u8,
 
     // Sync with: ghostty_action_mouse_over_link_s
     pub const C = extern struct {
@@ -437,6 +602,16 @@ pub const SizeLimit = extern struct {
 pub const InitialSize = extern struct {
     width: u32,
     height: u32,
+
+    /// Make this a valid gobject if we're in a GTK environment.
+    pub const getGObjectType = switch (build_config.app_runtime) {
+        .gtk => @import("gobject").ext.defineBoxed(
+            InitialSize,
+            .{ .name = "GhosttyApprtInitialSize" },
+        ),
+
+        .none => void,
+    };
 };
 
 pub const CellSize = extern struct {
@@ -457,6 +632,15 @@ pub const SetTitle = struct {
             .title = self.title.ptr,
         };
     }
+
+    pub fn format(
+        value: @This(),
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.print("{s}{{ {s} }}", .{ @typeName(@This()), value.title });
+    }
 };
 
 pub const Pwd = struct {
@@ -471,6 +655,15 @@ pub const Pwd = struct {
         return .{
             .pwd = self.pwd.ptr,
         };
+    }
+
+    pub fn format(
+        value: @This(),
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.print("{s}{{ {s} }}", .{ @typeName(@This()), value.pwd });
     }
 };
 
@@ -491,6 +684,19 @@ pub const DesktopNotification = struct {
             .body = self.body.ptr,
         };
     }
+
+    pub fn format(
+        value: @This(),
+        comptime _: []const u8,
+        _: std.fmt.FormatOptions,
+        writer: *std.Io.Writer,
+    ) !void {
+        try writer.print("{s}{{ title: {s}, body: {s} }}", .{
+            @typeName(@This()),
+            value.title,
+            value.body,
+        });
+    }
 };
 
 pub const KeySequence = union(enum) {
@@ -507,6 +713,50 @@ pub const KeySequence = union(enum) {
         return switch (self) {
             .trigger => |t| .{ .active = true, .trigger = t.cval() },
             .end => .{ .active = false, .trigger = .{} },
+        };
+    }
+};
+
+pub const KeyTable = union(enum) {
+    activate: []const u8,
+    deactivate,
+    deactivate_all,
+
+    // Sync with: ghostty_action_key_table_tag_e
+    pub const Tag = enum(c_int) {
+        activate,
+        deactivate,
+        deactivate_all,
+    };
+
+    // Sync with: ghostty_action_key_table_u
+    pub const CValue = extern union {
+        activate: extern struct {
+            name: [*]const u8,
+            len: usize,
+        },
+    };
+
+    // Sync with: ghostty_action_key_table_s
+    pub const C = extern struct {
+        tag: Tag,
+        value: CValue,
+    };
+
+    pub fn cval(self: KeyTable) C {
+        return switch (self) {
+            .activate => |name| .{
+                .tag = .activate,
+                .value = .{ .activate = .{ .name = name.ptr, .len = name.len } },
+            },
+            .deactivate => .{
+                .tag = .deactivate,
+                .value = undefined,
+            },
+            .deactivate_all => .{
+                .tag = .deactivate_all,
+                .value = undefined,
+            },
         };
     }
 };
@@ -546,6 +796,123 @@ pub const ConfigChange = struct {
     pub fn cval(self: ConfigChange) C {
         return .{
             .config = self.config,
+        };
+    }
+};
+
+/// Open a URL
+pub const OpenUrl = struct {
+    /// The type of data that the URL refers to.
+    kind: Kind,
+
+    /// The URL.
+    url: []const u8,
+
+    /// The type of the data at the URL to open. This is used as a hint to
+    /// potentially open the URL in a different way.
+    ///
+    /// Sync with: ghostty_action_open_url_kind_e
+    pub const Kind = enum(c_int) {
+        /// The type is unknown. This is the default and apprts should
+        /// open the URL in the most generic way possible. For example,
+        /// on macOS this would be the equivalent of `open` or on Linux
+        /// this would be `xdg-open`.
+        unknown,
+
+        /// The URL is known to be a text file. In this case, the apprt
+        /// should try to open the URL in a text editor or viewer or
+        /// some equivalent, if possible.
+        text,
+
+        /// The URL is known to contain HTML content.
+        html,
+    };
+
+    // Sync with: ghostty_action_open_url_s
+    pub const C = extern struct {
+        kind: Kind,
+        url: [*]const u8,
+        len: usize,
+    };
+
+    pub fn cval(self: OpenUrl) C {
+        return .{
+            .kind = self.kind,
+            .url = self.url.ptr,
+            .len = self.url.len,
+        };
+    }
+};
+
+/// sync with ghostty_action_close_tab_mode_e in ghostty.h
+pub const CloseTabMode = enum(c_int) {
+    /// Close the current tab.
+    this,
+    /// Close all other tabs.
+    other,
+    /// Close all tabs to the right of the current tab.
+    right,
+};
+
+pub const CommandFinished = struct {
+    exit_code: ?u8,
+    duration: configpkg.Config.Duration,
+
+    /// sync with ghostty_action_command_finished_s in ghostty.h
+    pub const C = extern struct {
+        exit_code: i16,
+        duration: u64,
+    };
+
+    pub fn cval(self: CommandFinished) C {
+        return .{
+            .exit_code = self.exit_code orelse -1,
+            .duration = self.duration.duration,
+        };
+    }
+};
+
+pub const StartSearch = struct {
+    needle: [:0]const u8,
+
+    // Sync with: ghostty_action_start_search_s
+    pub const C = extern struct {
+        needle: [*:0]const u8,
+    };
+
+    pub fn cval(self: StartSearch) C {
+        return .{
+            .needle = self.needle.ptr,
+        };
+    }
+};
+
+pub const SearchTotal = struct {
+    total: ?usize,
+
+    // Sync with: ghostty_action_search_total_s
+    pub const C = extern struct {
+        total: isize,
+    };
+
+    pub fn cval(self: SearchTotal) C {
+        return .{
+            .total = if (self.total) |t| @intCast(t) else -1,
+        };
+    }
+};
+
+pub const SearchSelected = struct {
+    selected: ?usize,
+
+    // Sync with: ghostty_action_search_selected_s
+    pub const C = extern struct {
+        selected: isize,
+    };
+
+    pub fn cval(self: SearchSelected) C {
+        return .{
+            .selected = if (self.selected) |s| @intCast(s) else -1,
         };
     }
 };

@@ -4,13 +4,12 @@ Ghostty relies on downstream package maintainers to distribute Ghostty to
 end-users. This document provides guidance to package maintainers on how to
 package Ghostty for distribution.
 
-> [!NOTE]
+> [!IMPORTANT]
 >
-> While Ghostty went through an extensive private beta testing period,
-> packaging Ghostty is immature and may require additional build script
-> tweaks and documentation improvement. I'm extremely motivated to work with
-> package maintainers to improve the packaging process. Please open issues
-> to discuss any packaging issues you encounter.
+> This document is only accurate for the Ghostty source alongside it.
+> **Do not use this document for older or newer versions of Ghostty!** If
+> you are reading this document in a different version of Ghostty, please
+> find the `PACKAGING.md` file alongside that version.
 
 ## Source Tarballs
 
@@ -22,13 +21,6 @@ at `release.files.ghostty.org` in the following URL format where
 https://release.files.ghostty.org/VERSION/ghostty-VERSION.tar.gz
 https://release.files.ghostty.org/VERSION/ghostty-VERSION.tar.gz.minisig
 ```
-
-> [!NOTE]
->
-> **Version 1.0.0 the filename is `ghostty-source.tar.gz`.** Future
-> versions will use the `ghostty-VERSION.tar.gz` format since it is more
-> typical for source tarballs. But for version 1.0.0, the filename is
-> `ghostty-source.tar.gz`.
 
 Signature files are signed with
 [minisign](https://jedisct1.github.io/minisign/)
@@ -44,6 +36,19 @@ Use the `ghostty-source.tar.gz` asset and _not the GitHub auto-generated
 source tarball_. These tarballs are generated for every commit to
 the `main` branch and are not associated with a specific version.
 
+> [!WARNING]
+>
+> Source tarballs are _not the same_ as a Git checkout. Source tarballs
+> contain some preprocessed files that allow building Ghostty with less
+> dependencies. If you are building Ghostty from a Git checkout, the
+> steps below are the same but they may require additional dependencies
+> not listed here. See the `README.md` for more information on building
+> from a Git checkout.
+>
+> For everyone except Ghostty developers, please use the source tarballs.
+> We generate tip source tarballs for users following the development
+> branch.
+
 ## Zig Version
 
 [Zig](https://ziglang.org) is required to build Ghostty. Prior to Zig 1.0,
@@ -55,7 +60,7 @@ To find the version of Zig required to build Ghostty, check the `required_zig`
 constant in `build.zig`. You don't need to know Zig to extract this information.
 This version will always be an official released version of Zig.
 
-For example, at the time of writing this document, Ghostty requires Zig 0.13.0.
+For example, at the time of writing this document, Ghostty requires Zig 0.14.0.
 
 ## Building Ghostty
 
@@ -117,11 +122,3 @@ relevant to package maintainers:
   often necessary for system packages to specify a specific minimum Linux
   version, glibc, etc. Run `zig targets` to a get a full list of available
   targets.
-
-> [!WARNING]
->
-> **The GLFW runtime is not meant for distribution.** The GLFW runtime
-> (`-Dapp-runtime=glfw`) is meant for development and testing only. It is
-> missing many features, has known memory leak scenarios, known crashes,
-> and more. Please do not package the GLFW-based Ghostty runtime for
-> distribution.

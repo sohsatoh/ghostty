@@ -1,5 +1,5 @@
 const std = @import("std");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const fastmem = @import("../fastmem.zig");
 
@@ -91,15 +91,24 @@ pub fn CircBuf(comptime T: type, comptime default: T) type {
             self.full = self.head == self.tail;
         }
 
-        /// Append a slice to the buffer. If the buffer cannot fit the
-        /// entire slice then an error will be returned. It is up to the
-        /// caller to rotate the circular buffer if they want to overwrite
-        /// the oldest data.
-        pub fn appendSlice(
+        /// Append a single value to the buffer, assuming there is capacity.
+        pub fn appendAssumeCapacity(self: *Self, v: T) void {
+            assert(!self.full);
+            self.storage[self.head] = v;
+            self.head += 1;
+            if (self.head >= self.storage.len) self.head = 0;
+            self.full = self.head == self.tail;
+        }
+
+        /// Append a slice to the buffer.
+        pub fn appendSliceAssumeCapacity(
             self: *Self,
             slice: []const T,
-        ) Allocator.Error!void {
-            const storage = self.getPtrSlice(self.len(), slice.len);
+        ) void {
+            const storage = self.getPtrSlice(
+                self.len(),
+                slice.len,
+            );
             fastmem.copy(T, storage[0], slice[0..storage[0].len]);
             fastmem.copy(T, storage[1], slice[storage[0].len..]);
         }
@@ -152,7 +161,7 @@ pub fn CircBuf(comptime T: type, comptime default: T) type {
         /// If larger, new values will be set to the default value.
         pub fn resize(self: *Self, alloc: Allocator, size: usize) Allocator.Error!void {
             // Rotate to zero so it is aligned.
-            try self.rotateToZero(alloc);
+            try self.rotateToZero();
 
             // Reallocate, this adds to the end so we're ready to go.
             const prev_len = self.len();
@@ -173,29 +182,16 @@ pub fn CircBuf(comptime T: type, comptime default: T) type {
         }
 
         /// Rotate the data so that it is zero-aligned.
-        fn rotateToZero(self: *Self, alloc: Allocator) Allocator.Error!void {
-            // TODO: this does this in the worst possible way by allocating.
-            // rewrite to not allocate, its possible, I'm just lazy right now.
-
+        fn rotateToZero(self: *Self) Allocator.Error!void {
             // If we're already at zero then do nothing.
             if (self.tail == 0) return;
 
-            var buf = try alloc.alloc(T, self.storage.len);
-            defer {
-                self.head = if (self.full) 0 else self.len();
-                self.tail = 0;
-                alloc.free(self.storage);
-                self.storage = buf;
-            }
+            // We use std.mem.rotate to rotate our storage in-place.
+            std.mem.rotate(T, self.storage, self.tail);
 
-            if (!self.full and self.head >= self.tail) {
-                fastmem.copy(T, buf, self.storage[self.tail..self.head]);
-                return;
-            }
-
-            const middle = self.storage.len - self.tail;
-            fastmem.copy(T, buf, self.storage[self.tail..]);
-            fastmem.copy(T, buf[middle..], self.storage[0..self.head]);
+            // Then fix up our head and tail.
+            self.head = self.len() % self.storage.len;
+            self.tail = 0;
         }
 
         /// Returns if the buffer is currently empty. To check if its
@@ -221,6 +217,13 @@ pub fn CircBuf(comptime T: type, comptime default: T) type {
         pub fn deleteOldest(self: *Self, n: usize) void {
             assert(n <= self.storage.len);
 
+            // Special case n == 0 otherwise we will accidentally break
+            // our circular buffer.
+            if (n == 0) {
+                @branchHint(.cold);
+                return;
+            }
+
             // Clear the values back to default
             const slices = self.getPtrSlice(0, n);
             inline for (slices) |slice| @memset(slice, default);
@@ -237,6 +240,12 @@ pub fn CircBuf(comptime T: type, comptime default: T) type {
         /// the end of our buffer. This never "rotates" the buffer because
         /// the offset can only be within the size of the buffer.
         pub fn getPtrSlice(self: *Self, offset: usize, slice_len: usize) [2][]T {
+            // Special case the empty slice fast-path.
+            if (slice_len == 0) {
+                @branchHint(.cold);
+                return .{ &.{}, &.{} };
+            }
+
             // Note: this assertion is very important, it hints the compiler
             // which generates ~10% faster code than without it.
             assert(offset + slice_len <= self.capacity());
@@ -469,7 +478,7 @@ test "CircBuf append slice" {
     var buf = try Buf.init(alloc, 5);
     defer buf.deinit(alloc);
 
-    try buf.appendSlice("hello");
+    buf.appendSliceAssumeCapacity("hello");
     {
         var it = buf.iterator(.forward);
         try testing.expect(it.next().?.* == 'h');
@@ -499,7 +508,7 @@ test "CircBuf append slice with wrap" {
     try testing.expect(!buf.full);
     try testing.expectEqual(@as(usize, 2), buf.len());
 
-    try buf.appendSlice("AB");
+    buf.appendSliceAssumeCapacity("AB");
     {
         var it = buf.iterator(.forward);
         try testing.expect(it.next().?.* == 0);
@@ -589,7 +598,7 @@ test "CircBuf rotateToZero" {
     defer buf.deinit(alloc);
 
     _ = buf.getPtrSlice(0, 11);
-    try buf.rotateToZero(alloc);
+    try buf.rotateToZero();
 }
 
 test "CircBuf rotateToZero offset" {
@@ -611,7 +620,7 @@ test "CircBuf rotateToZero offset" {
     try testing.expect(buf.tail > 0 and buf.head >= buf.tail);
 
     // Rotate to zero
-    try buf.rotateToZero(alloc);
+    try buf.rotateToZero();
     try testing.expectEqual(@as(usize, 0), buf.tail);
     try testing.expectEqual(@as(usize, 1), buf.head);
 }
@@ -645,7 +654,7 @@ test "CircBuf rotateToZero wraps" {
     }
 
     // Rotate to zero
-    try buf.rotateToZero(alloc);
+    try buf.rotateToZero();
     try testing.expectEqual(@as(usize, 0), buf.tail);
     try testing.expectEqual(@as(usize, 3), buf.head);
     {
@@ -681,7 +690,7 @@ test "CircBuf rotateToZero full no wrap" {
     }
 
     // Rotate to zero
-    try buf.rotateToZero(alloc);
+    try buf.rotateToZero();
     try testing.expect(buf.full);
     try testing.expectEqual(@as(usize, 0), buf.tail);
     try testing.expectEqual(@as(usize, 0), buf.head);
@@ -782,4 +791,76 @@ test "CircBuf resize shrink" {
         try testing.expectEqual(@as(u8, 2), slices[0][1]);
         try testing.expectEqual(@as(u8, 3), slices[0][2]);
     }
+}
+
+test "CircBuf append empty slice" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Buf = CircBuf(u8, 0);
+    var buf = try Buf.init(alloc, 5);
+    defer buf.deinit(alloc);
+
+    // Appending an empty slice to empty buffer should be a no-op
+    buf.appendSliceAssumeCapacity("");
+    try testing.expectEqual(@as(usize, 0), buf.len());
+    try testing.expect(!buf.full);
+
+    // Buffer should still work normally after appending empty slice
+    buf.appendSliceAssumeCapacity("hi");
+    try testing.expectEqual(@as(usize, 2), buf.len());
+
+    // Appending an empty slice to non-empty buffer should also be a no-op
+    buf.appendSliceAssumeCapacity("");
+    try testing.expectEqual(@as(usize, 2), buf.len());
+}
+
+test "CircBuf getPtrSlice zero length" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Buf = CircBuf(u8, 0);
+    var buf = try Buf.init(alloc, 5);
+    defer buf.deinit(alloc);
+
+    // getPtrSlice with zero length on empty buffer should return empty slices
+    const slices = buf.getPtrSlice(0, 0);
+    try testing.expectEqual(@as(usize, 0), slices[0].len);
+    try testing.expectEqual(@as(usize, 0), slices[1].len);
+    try testing.expectEqual(@as(usize, 0), buf.len());
+
+    // Fill buffer partially
+    buf.appendSliceAssumeCapacity("abc");
+    try testing.expectEqual(@as(usize, 3), buf.len());
+
+    // getPtrSlice with zero length on non-empty buffer should also work
+    const slices2 = buf.getPtrSlice(0, 0);
+    try testing.expectEqual(@as(usize, 0), slices2[0].len);
+    try testing.expectEqual(@as(usize, 0), slices2[1].len);
+    try testing.expectEqual(@as(usize, 3), buf.len());
+}
+
+test "CircBuf deleteOldest zero" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const Buf = CircBuf(u8, 0);
+    var buf = try Buf.init(alloc, 5);
+    defer buf.deinit(alloc);
+
+    // deleteOldest(0) on empty buffer should be a no-op
+    buf.deleteOldest(0);
+    try testing.expectEqual(@as(usize, 0), buf.len());
+
+    // Fill buffer
+    buf.appendSliceAssumeCapacity("hello");
+    try testing.expectEqual(@as(usize, 5), buf.len());
+
+    // deleteOldest(0) on non-empty buffer should be a no-op
+    buf.deleteOldest(0);
+    try testing.expectEqual(@as(usize, 5), buf.len());
+
+    // Verify data is unchanged
+    var it = buf.iterator(.forward);
+    try testing.expectEqual(@as(u8, 'h'), it.next().?.*);
 }

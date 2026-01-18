@@ -17,7 +17,6 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const macos = @import("macos");
 const codes = @import("keycodes.zig").entries;
-const Key = @import("key.zig").Key;
 const Mods = @import("key.zig").Mods;
 
 /// The current input source that is selected for the keyboard. This can
@@ -50,10 +49,13 @@ pub const State = struct {
 pub const Translation = struct {
     /// The translation result. If this is a dead key state, then this will
     /// be pre-edit text that can be displayed but will ultimately be replaced.
-    text: []const u8,
+    text: []const u8 = "",
 
     /// Whether the text is still composing, i.e. this is a dead key state.
-    composing: bool,
+    composing: bool = false,
+
+    /// The mods that were consumed to produce this translation
+    mods: Mods = .{},
 };
 
 pub fn init() !Keymap {
@@ -122,8 +124,18 @@ pub fn translate(
     out: []u8,
     state: *State,
     code: u16,
-    mods: Mods,
+    input_mods: Mods,
 ) !Translation {
+    // On macOS we strip ctrl because UCKeyTranslate
+    // converts to the masked values (i.e. ctrl+c becomes 3)
+    // and we don't want that behavior in Ghostty ever. This makes
+    // this file not a general-purpose keymap implementation.
+    const mods: Mods = mods: {
+        var v = input_mods;
+        v.ctrl = false;
+        break :mods v;
+    };
+
     // Get the keycode for the space key, using comptime.
     const code_space: u16 = comptime space: for (codes) |entry| {
         if (std.mem.eql(u8, entry.code, "Space"))
@@ -182,8 +194,12 @@ pub fn translate(
     } else false;
 
     // Convert the utf16 to utf8
-    const len = try std.unicode.utf16leToUtf8(out, char[0..char_count]);
-    return .{ .text = out[0..len], .composing = composing };
+    const len = try std.unicode.utf16LeToUtf8(out, char[0..char_count]);
+    return .{
+        .text = out[0..len],
+        .composing = composing,
+        .mods = mods,
+    };
 }
 
 /// Map to the modifiers format used by the UCKeyTranslate function.

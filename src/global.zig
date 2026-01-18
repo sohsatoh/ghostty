@@ -9,7 +9,12 @@ const harfbuzz = @import("harfbuzz");
 const oni = @import("oniguruma");
 const crash = @import("crash/main.zig");
 const renderer = @import("renderer.zig");
-const xev = @import("xev");
+const apprt = @import("apprt.zig");
+
+/// We export the xev backend we want to use so that the rest of
+/// Ghostty can import this once and have access to the proper
+/// backend.
+pub const xev = @import("xev").Dynamic;
 
 /// Global process state. This is initialized in main() for exe artifacts
 /// and by ghostty_init() for lib artifacts. This should ONLY be used by
@@ -25,18 +30,22 @@ pub const GlobalState = struct {
 
     gpa: ?GPA,
     alloc: std.mem.Allocator,
-    action: ?cli.Action,
+    action: ?cli.ghostty.Action,
     logging: Logging,
     rlimits: ResourceLimits = .{},
 
     /// The app resources directory, equivalent to zig-out/share when we build
     /// from source. This is null if we can't detect it.
-    resources_dir: ?[]const u8,
+    resources_dir: internal_os.ResourcesDir,
 
     /// Where logging should go
-    pub const Logging = union(enum) {
-        disabled: void,
-        stderr: void,
+    pub const Logging = packed struct {
+        /// Whether to log to stderr. For lib mode we always disable stderr
+        /// logging by default. Otherwise it's enabled by default.
+        stderr: bool = build_config.app_runtime != .none,
+        /// Whether to log to macOS's unified logging. Enabled by default
+        /// on macOS.
+        macos: bool = builtin.os.tag.isDarwin(),
     };
 
     /// Initialize the global state.
@@ -56,9 +65,9 @@ pub const GlobalState = struct {
             .gpa = null,
             .alloc = undefined,
             .action = null,
-            .logging = .{ .stderr = {} },
+            .logging = .{},
             .rlimits = .{},
-            .resources_dir = null,
+            .resources_dir = .{},
         };
         errdefer self.deinit();
 
@@ -87,17 +96,15 @@ pub const GlobalState = struct {
             unreachable;
 
         // We first try to parse any action that we may be executing.
-        self.action = try cli.Action.detectCLI(self.alloc);
+        self.action = try cli.action.detectArgs(
+            cli.ghostty.Action,
+            self.alloc,
+        );
 
         // If we have an action executing, we disable logging by default
         // since we write to stderr we don't want logs messing up our
         // output.
-        if (self.action != null) self.logging = .{ .disabled = {} };
-
-        // For lib mode we always disable stderr logging by default.
-        if (comptime build_config.app_runtime == .none) {
-            self.logging = .{ .disabled = {} };
-        }
+        if (self.action != null) self.logging.stderr = false;
 
         // I don't love the env var name but I don't have it in my heart
         // to parse CLI args 3 times (once for actions, once for config,
@@ -106,13 +113,17 @@ pub const GlobalState = struct {
         // easy to set.
         if ((try internal_os.getenv(self.alloc, "GHOSTTY_LOG"))) |v| {
             defer v.deinit(self.alloc);
-            if (v.value.len > 0) {
-                self.logging = .{ .stderr = {} };
-            }
+            self.logging = cli.args.parsePackedStruct(Logging, v.value) catch .{};
         }
 
         // Setup our signal handlers before logging
         initSignals();
+
+        // Setup our Xev backend if we're dynamic
+        if (comptime xev.dynamic) xev.detect() catch |err| {
+            std.log.warn("failed to detect xev backend, falling back to " ++
+                "most compatible backend err={}", .{err});
+        };
 
         // Output some debug information right away
         std.log.info("ghostty version={s}", .{build_config.version_string});
@@ -126,10 +137,10 @@ pub const GlobalState = struct {
             std.log.info("dependency fontconfig={d}", .{fontconfig.version()});
         }
         std.log.info("renderer={}", .{renderer.Renderer});
-        std.log.info("libxev backend={}", .{xev.backend});
+        std.log.info("libxev default backend={t}", .{xev.backend});
 
         // As early as possible, initialize our resource limits.
-        self.rlimits = ResourceLimits.init();
+        self.rlimits = .init();
 
         // Initialize our crash reporting.
         crash.init(self.alloc) catch |err| {
@@ -160,14 +171,19 @@ pub const GlobalState = struct {
 
         // Find our resources directory once for the app so every launch
         // hereafter can use this cached value.
-        self.resources_dir = try internal_os.resourcesDir(self.alloc);
-        errdefer if (self.resources_dir) |dir| self.alloc.free(dir);
+        self.resources_dir = try apprt.runtime.resourcesDir(self.alloc);
+        errdefer self.resources_dir.deinit(self.alloc);
+
+        // Setup i18n
+        if (self.resources_dir.app()) |v| internal_os.i18n.init(v) catch |err| {
+            std.log.warn("failed to init i18n, translations will not be available err={}", .{err});
+        };
     }
 
     /// Cleans up the global state. This doesn't _need_ to be called but
     /// doing so in dev modes will check for memory leaks.
     pub fn deinit(self: *GlobalState) void {
-        if (self.resources_dir) |dir| self.alloc.free(dir);
+        self.resources_dir.deinit(self.alloc);
 
         // Flush our crash logs
         crash.deinit();
@@ -187,7 +203,7 @@ pub const GlobalState = struct {
 
         var sa: p.Sigaction = .{
             .handler = .{ .handler = p.SIG.IGN },
-            .mask = p.empty_sigset,
+            .mask = p.sigemptyset(),
             .flags = 0,
         };
 
@@ -196,9 +212,7 @@ pub const GlobalState = struct {
         // often write to a broken pipe to exit the read thread. This should
         // be fixed one day but for now this helps make this a bit more
         // robust.
-        p.sigaction(p.SIG.PIPE, &sa, null) catch |err| {
-            std.log.warn("failed to ignore SIGPIPE err={}", .{err});
-        };
+        p.sigaction(p.SIG.PIPE, &sa, null);
     }
 };
 

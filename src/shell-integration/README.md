@@ -47,7 +47,19 @@ made available for use as modules by way of `use <filename>`.
 Ghostty launches Elvish, passing the environment with `XDG_DATA_DIRS`prepended
 with `$GHOSTTY_RESOURCES_DIR/src/shell-integration`. It contains
 `./elvish/lib/ghostty-integration.elv`. The user can then import it
-by `use ghostty-integration`, which will run the integration routines.
+by `use ghostty-integration` every time after shell startup or
+autostart integration in `$XDG_CONFIG_HOME/elvish/rc.elv`,
+which will run the integration routines.
+
+If you decide to autostart `ghostty-integration` with `rc.elv`, you should
+detect whether the terminal is Ghostty or not. To do this, add this to the end
+of your `rc.elv` file:
+
+```elvish
+if (eq $E:TERM "xterm-ghostty") {
+  use ghostty-integration
+}
+```
 
 The [Elvish](https://elv.sh) shell integration is supported by
 the community and is not officially supported by Ghostty. We distribute
@@ -66,13 +78,21 @@ on the Fish startup process, see the
 
 ### Zsh
 
-For `zsh`, Ghostty sets `ZDOTDIR` so that it loads our configuration
-from the `zsh` directory. The existing `ZDOTDIR` is retained so that
-after loading the Ghostty shell integration the normal Zsh loading
-sequence occurs.
+Automatic [Zsh](https://www.zsh.org/) integration works by temporarily setting
+`ZDOTDIR` to our `zsh` directory. An existing `ZDOTDIR` environment variable
+value will be retained and restored after our shell integration scripts are
+run.
 
-```bash
+However, if `ZDOTDIR` is set in a system-wide file like `/etc/zshenv`, it will
+override Ghostty's `ZDOTDIR` value, preventing the shell integration from being
+loaded. In this case, the shell integration needs to be loaded manually.
+
+To load the Zsh shell integration manually:
+
+```zsh
 if [[ -n $GHOSTTY_RESOURCES_DIR ]]; then
   source "$GHOSTTY_RESOURCES_DIR"/shell-integration/zsh/ghostty-integration
 fi
 ```
+
+Shell integration requires Zsh 5.1+.

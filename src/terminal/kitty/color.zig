@@ -16,6 +16,17 @@ pub const OSC = struct {
     /// We must reply with the same string terminator (ST) as used in the
     /// request.
     terminator: Terminator = .st,
+
+    pub fn deinit(self: *OSC, alloc: std.mem.Allocator) void {
+        self.list.deinit(alloc);
+    }
+
+    /// We don't currently support encoding this to C in any way.
+    pub const C = void;
+
+    pub fn cval(_: OSC) C {
+        return {};
+    }
 };
 
 pub const Special = enum {
@@ -30,7 +41,7 @@ pub const Special = enum {
 };
 
 pub const Kind = union(enum) {
-    pub const max: usize = std.math.maxInt(u8) + @typeInfo(Special).Enum.fields.len;
+    pub const max: usize = std.math.maxInt(u8) + @typeInfo(Special).@"enum".fields.len;
 
     palette: u8,
     special: Special,
@@ -42,13 +53,8 @@ pub const Kind = union(enum) {
 
     pub fn format(
         self: Kind,
-        comptime layout: []const u8,
-        opts: std.fmt.FormatOptions,
-        writer: anytype,
+        writer: *std.Io.Writer,
     ) !void {
-        _ = layout;
-        _ = opts;
-
         switch (self) {
             .palette => |p| try writer.print("{d}", .{p}),
             .special => |s| try writer.print("{s}", .{@tagName(s)}),
@@ -61,11 +67,11 @@ test "OSC: kitty color protocol kind string" {
 
     var buf: [256]u8 = undefined;
     {
-        const actual = try std.fmt.bufPrint(&buf, "{}", .{Kind{ .special = .foreground }});
+        const actual = try std.fmt.bufPrint(&buf, "{f}", .{Kind{ .special = .foreground }});
         try testing.expectEqualStrings("foreground", actual);
     }
     {
-        const actual = try std.fmt.bufPrint(&buf, "{}", .{Kind{ .palette = 42 }});
+        const actual = try std.fmt.bufPrint(&buf, "{f}", .{Kind{ .palette = 42 }});
         try testing.expectEqualStrings("42", actual);
     }
 }

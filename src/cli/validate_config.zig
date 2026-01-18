@@ -1,9 +1,8 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const args = @import("args.zig");
-const Action = @import("action.zig").Action;
+const Action = @import("ghostty.zig").Action;
 const Config = @import("../config.zig").Config;
-const cli = @import("../cli.zig");
 
 pub const Options = struct {
     /// The path of the config file to validate. If this isn't specified,
@@ -40,8 +39,19 @@ pub fn run(alloc: std.mem.Allocator) !u8 {
         try args.parse(Options, alloc, &opts, &iter);
     }
 
-    const stdout = std.io.getStdOut().writer();
+    var buffer: [1024]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&buffer);
+    const stdout = &stdout_writer.interface;
+    const result = runInner(alloc, opts, stdout);
+    try stdout_writer.end();
+    return result;
+}
 
+fn runInner(
+    alloc: std.mem.Allocator,
+    opts: Options,
+    stdout: *std.Io.Writer,
+) !u8 {
     var cfg = try Config.default(alloc);
     defer cfg.deinit();
 
@@ -58,15 +68,9 @@ pub fn run(alloc: std.mem.Allocator) !u8 {
     try cfg.finalize();
 
     if (cfg._diagnostics.items().len > 0) {
-        var buf = std.ArrayList(u8).init(alloc);
-        defer buf.deinit();
-
         for (cfg._diagnostics.items()) |diag| {
-            try diag.write(buf.writer());
-            try stdout.print("{s}\n", .{buf.items});
-            buf.clearRetainingCapacity();
+            try stdout.print("{f}\n", .{diag});
         }
-
         return 1;
     }
 

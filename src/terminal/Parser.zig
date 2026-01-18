@@ -5,8 +5,6 @@
 const Parser = @This();
 
 const std = @import("std");
-const builtin = @import("builtin");
-const assert = std.debug.assert;
 const testing = std.testing;
 const table = @import("parse_table.zig").table;
 const osc = @import("osc.zig");
@@ -86,7 +84,9 @@ pub const Action = union(enum) {
         final: u8,
 
         /// The list of separators used for CSI params. The value of the
-        /// bit can be mapped to Sep.
+        /// bit can be mapped to Sep. The index of this bit set specifies
+        /// the separator AFTER that param. For example: 0;4:3 would have
+        /// index 1 set.
         pub const SepList = std.StaticBitSet(MAX_PARAMS);
 
         /// The separator used for CSI params.
@@ -95,13 +95,9 @@ pub const Action = union(enum) {
         // Implement formatter for logging
         pub fn format(
             self: CSI,
-            comptime layout: []const u8,
-            opts: std.fmt.FormatOptions,
-            writer: anytype,
+            writer: *std.Io.Writer,
         ) !void {
-            _ = layout;
-            _ = opts;
-            try std.fmt.format(writer, "ESC [ {s} {any} {c}", .{
+            try writer.print("ESC [ {s} {any} {c}", .{
                 self.intermediates,
                 self.params,
                 self.final,
@@ -116,13 +112,9 @@ pub const Action = union(enum) {
         // Implement formatter for logging
         pub fn format(
             self: ESC,
-            comptime layout: []const u8,
-            opts: std.fmt.FormatOptions,
-            writer: anytype,
+            writer: *std.Io.Writer,
         ) !void {
-            _ = layout;
-            _ = opts;
-            try std.fmt.format(writer, "ESC {s} {c}", .{
+            try writer.print("ESC {s} {c}", .{
                 self.intermediates,
                 self.final,
             });
@@ -133,6 +125,14 @@ pub const Action = union(enum) {
         intermediates: []const u8 = "",
         params: []const u16 = &.{},
         final: u8,
+
+        pub const C = extern struct {
+            intermediates: [*]const u8,
+            intermediates_len: usize,
+            params: [*]const u16,
+            params_len: usize,
+            final: u8,
+        };
     };
 
     // Implement formatter for logging. This is mostly copied from the
@@ -140,13 +140,10 @@ pub const Action = union(enum) {
     // print out custom formats for some of our primitives.
     pub fn format(
         self: Action,
-        comptime layout: []const u8,
-        opts: std.fmt.FormatOptions,
-        writer: anytype,
+        writer: *std.Io.Writer,
     ) !void {
-        _ = layout;
         const T = Action;
-        const info = @typeInfo(T).Union;
+        const info = @typeInfo(T).@"union";
 
         try writer.writeAll(@typeName(T));
         if (info.tag_type) |TagType| {
@@ -160,21 +157,20 @@ pub const Action = union(enum) {
                     const value = @field(self, u_field.name);
                     switch (@TypeOf(value)) {
                         // Unicode
-                        u21 => try std.fmt.format(writer, "'{u}' (U+{X})", .{ value, value }),
+                        u21 => try writer.print("'{u}' (U+{X})", .{ value, value }),
 
                         // Byte
-                        u8 => try std.fmt.format(writer, "0x{x}", .{value}),
+                        u8 => try writer.print("0x{x}", .{value}),
 
                         // Note: we don't do ASCII (u8) because there are a lot
                         // of invisible characters we don't want to handle right
                         // now.
 
                         // All others do the default behavior
-                        else => try std.fmt.formatType(
-                            @field(self, u_field.name),
+                        else => try writer.printValue(
                             "any",
-                            opts,
-                            writer,
+                            .{},
+                            @field(self, u_field.name),
                             3,
                         ),
                     }
@@ -191,28 +187,58 @@ pub const Action = union(enum) {
 /// Maximum number of intermediate characters during parsing. This is
 /// 4 because we also use the intermediates array for UTF8 decoding which
 /// can be at most 4 bytes.
-const MAX_INTERMEDIATE = 4;
-const MAX_PARAMS = 16;
+pub const MAX_INTERMEDIATE = 4;
+
+/// Maximum number of CSI parameters. This is arbitrary. Practically, the
+/// only CSI command that uses more than 3 parameters is the SGR command
+/// which can be infinitely long. 24 is a reasonable limit based on empirical
+/// data. This used to be 16 but Kakoune has a SGR command that uses 17
+/// parameters.
+///
+/// We could in the future make this the static limit and then allocate after
+/// but that's a lot more work and practically its so rare to exceed this
+/// number. I implore TUI authors to not use more than this number of CSI
+/// params, but I suspect we'll introduce a slow path with heap allocation
+/// one day.
+pub const MAX_PARAMS = 24;
 
 /// Current state of the state machine
-state: State = .ground,
+state: State,
 
 /// Intermediate tracking.
-intermediates: [MAX_INTERMEDIATE]u8 = undefined,
-intermediates_idx: u8 = 0,
+intermediates: [MAX_INTERMEDIATE]u8,
+intermediates_idx: u8,
 
 /// Param tracking, building
-params: [MAX_PARAMS]u16 = undefined,
-params_sep: Action.CSI.SepList = Action.CSI.SepList.initEmpty(),
-params_idx: u8 = 0,
-param_acc: u16 = 0,
-param_acc_idx: u8 = 0,
+params: [MAX_PARAMS]u16,
+params_sep: Action.CSI.SepList,
+params_idx: u8,
+param_acc: u16,
+param_acc_idx: u8,
 
 /// Parser for OSC sequences
-osc_parser: osc.Parser = .{},
+osc_parser: osc.Parser,
 
 pub fn init() Parser {
-    return .{};
+    var result: Parser = .{
+        .state = .ground,
+        .intermediates_idx = 0,
+        .params_sep = .initEmpty(),
+        .params_idx = 0,
+        .param_acc = 0,
+        .param_acc_idx = 0,
+        .osc_parser = .init(null),
+
+        .intermediates = undefined,
+        .params = undefined,
+    };
+    if (std.valgrind.runningOnValgrind() > 0) {
+        // Initialize our undefined fields so Valgrind can catch it.
+        // https://github.com/ziglang/zig/issues/19148
+        result.intermediates = undefined;
+        result.params = undefined;
+    }
+    return result;
 }
 
 pub fn deinit(self: *Parser) void {
@@ -242,7 +268,7 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
         // Exit depends on current state
         if (self.state == next_state) null else switch (self.state) {
             .osc_string => if (self.osc_parser.end(c)) |cmd|
-                Action{ .osc_dispatch = cmd }
+                Action{ .osc_dispatch = cmd.* }
             else
                 null,
             .dcs_passthrough => Action{ .dcs_unhook = {} },
@@ -282,8 +308,9 @@ pub fn next(self: *Parser, c: u8) [3]?Action {
     };
 }
 
-pub fn collect(self: *Parser, c: u8) void {
+pub inline fn collect(self: *Parser, c: u8) void {
     if (self.intermediates_idx >= MAX_INTERMEDIATE) {
+        @branchHint(.cold);
         log.warn("invalid intermediates count", .{});
         return;
     }
@@ -292,7 +319,7 @@ pub fn collect(self: *Parser, c: u8) void {
     self.intermediates_idx += 1;
 }
 
-fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
+inline fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
     return switch (action) {
         .none, .ignore => null,
         .print => Action{ .print = c },
@@ -320,9 +347,7 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
             }
 
             // A numeric value. Add it to our accumulator.
-            if (self.param_acc_idx > 0) {
-                self.param_acc *|= 10;
-            }
+            self.param_acc *|= 10;
             self.param_acc +|= c - '0';
 
             // Increment our accumulator index. If we overflow then
@@ -334,7 +359,7 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
             break :param null;
         },
         .osc_put => osc_put: {
-            self.osc_parser.next(c);
+            @call(.always_inline, osc.Parser.next, .{ &self.osc_parser, c });
             break :osc_put null;
         },
         .csi_dispatch => csi_dispatch: {
@@ -358,8 +383,9 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
 
             // We only allow colon or mixed separators for the 'm' command.
             if (c != 'm' and self.params_sep.count() > 0) {
+                @branchHint(.cold);
                 log.warn(
-                    "CSI colon or mixed separators only allowed for 'm' command, got: {}",
+                    "CSI colon or mixed separators only allowed for 'm' command, got: {f}",
                     .{result},
                 );
                 break :csi_dispatch null;
@@ -378,10 +404,10 @@ fn doAction(self: *Parser, action: TransitionAction, c: u8) ?Action {
     };
 }
 
-pub fn clear(self: *Parser) void {
+pub inline fn clear(self: *Parser) void {
     self.intermediates_idx = 0;
     self.params_idx = 0;
-    self.params_sep = Action.CSI.SepList.initEmpty();
+    self.params_sep = .initEmpty();
     self.param_acc = 0;
     self.param_acc_idx = 0;
 }
@@ -689,6 +715,64 @@ test "csi: SGR mixed colon and semicolon with blank" {
     }
 }
 
+// This is from a Kakoune actual SGR sequence also.
+test "csi: SGR mixed colon and semicolon setting underline, bg, fg" {
+    var p = init();
+    _ = p.next(0x1B);
+    for ("[4:3;38;2;51;51;51;48;2;170;170;170;58;2;255;97;136") |c| {
+        const a = p.next(c);
+        try testing.expect(a[0] == null);
+        try testing.expect(a[1] == null);
+        try testing.expect(a[2] == null);
+    }
+
+    {
+        const a = p.next('m');
+        try testing.expect(p.state == .ground);
+        try testing.expect(a[0] == null);
+        try testing.expect(a[1].? == .csi_dispatch);
+        try testing.expect(a[2] == null);
+
+        const d = a[1].?.csi_dispatch;
+        try testing.expect(d.final == 'm');
+        try testing.expectEqual(17, d.params.len);
+        try testing.expectEqual(@as(u16, 4), d.params[0]);
+        try testing.expect(d.params_sep.isSet(0));
+        try testing.expectEqual(@as(u16, 3), d.params[1]);
+        try testing.expect(!d.params_sep.isSet(1));
+        try testing.expectEqual(@as(u16, 38), d.params[2]);
+        try testing.expect(!d.params_sep.isSet(2));
+        try testing.expectEqual(@as(u16, 2), d.params[3]);
+        try testing.expect(!d.params_sep.isSet(3));
+        try testing.expectEqual(@as(u16, 51), d.params[4]);
+        try testing.expect(!d.params_sep.isSet(4));
+        try testing.expectEqual(@as(u16, 51), d.params[5]);
+        try testing.expect(!d.params_sep.isSet(5));
+        try testing.expectEqual(@as(u16, 51), d.params[6]);
+        try testing.expect(!d.params_sep.isSet(6));
+        try testing.expectEqual(@as(u16, 48), d.params[7]);
+        try testing.expect(!d.params_sep.isSet(7));
+        try testing.expectEqual(@as(u16, 2), d.params[8]);
+        try testing.expect(!d.params_sep.isSet(8));
+        try testing.expectEqual(@as(u16, 170), d.params[9]);
+        try testing.expect(!d.params_sep.isSet(9));
+        try testing.expectEqual(@as(u16, 170), d.params[10]);
+        try testing.expect(!d.params_sep.isSet(10));
+        try testing.expectEqual(@as(u16, 170), d.params[11]);
+        try testing.expect(!d.params_sep.isSet(11));
+        try testing.expectEqual(@as(u16, 58), d.params[12]);
+        try testing.expect(!d.params_sep.isSet(12));
+        try testing.expectEqual(@as(u16, 2), d.params[13]);
+        try testing.expect(!d.params_sep.isSet(13));
+        try testing.expectEqual(@as(u16, 255), d.params[14]);
+        try testing.expect(!d.params_sep.isSet(14));
+        try testing.expectEqual(@as(u16, 97), d.params[15]);
+        try testing.expect(!d.params_sep.isSet(15));
+        try testing.expectEqual(@as(u16, 136), d.params[16]);
+        try testing.expect(!d.params_sep.isSet(16));
+    }
+}
+
 test "csi: colon for non-m final" {
     var p = init();
     _ = p.next(0x1B);
@@ -805,7 +889,10 @@ test "osc: change window title (end in esc)" {
 // https://github.com/darrenstarr/VtNetCore/pull/14
 // Saw this on HN, decided to add a test case because why not.
 test "osc: 112 incomplete sequence" {
-    var p = init();
+    var p: Parser = init();
+    defer p.deinit();
+    p.osc_parser.alloc = std.testing.allocator;
+
     _ = p.next(0x1B);
     _ = p.next(']');
     _ = p.next('1');
@@ -820,8 +907,52 @@ test "osc: 112 incomplete sequence" {
         try testing.expect(a[2] == null);
 
         const cmd = a[0].?.osc_dispatch;
-        try testing.expect(cmd == .reset_color);
-        try testing.expectEqual(cmd.reset_color.kind, .cursor);
+        try testing.expect(cmd == .color_operation);
+        try testing.expectEqual(cmd.color_operation.terminator, .bel);
+        try testing.expect(cmd.color_operation.op == .osc_112);
+        try testing.expect(cmd.color_operation.requests.count() == 1);
+        var it = cmd.color_operation.requests.constIterator(0);
+        {
+            const op = it.next().?;
+            try testing.expect(op.* == .reset);
+            try testing.expectEqual(
+                osc.color.Request{ .reset = .{ .dynamic = .cursor } },
+                op.*,
+            );
+        }
+        try std.testing.expect(it.next() == null);
+    }
+}
+
+test "osc: 104 empty" {
+    var p: Parser = init();
+    defer p.deinit();
+    p.osc_parser.alloc = std.testing.allocator;
+
+    _ = p.next(0x1B);
+    _ = p.next(']');
+    _ = p.next('1');
+    _ = p.next('0');
+    _ = p.next('4');
+
+    {
+        const a = p.next(0x07);
+        try testing.expect(p.state == .ground);
+        try testing.expect(a[0].? == .osc_dispatch);
+        try testing.expect(a[1] == null);
+        try testing.expect(a[2] == null);
+
+        const cmd = a[0].?.osc_dispatch;
+        try testing.expect(cmd == .color_operation);
+        try testing.expectEqual(cmd.color_operation.terminator, .bel);
+        try testing.expect(cmd.color_operation.op == .osc_104);
+        try testing.expect(cmd.color_operation.requests.count() == 1);
+        var it = cmd.color_operation.requests.constIterator(0);
+        {
+            const op = it.next().?;
+            try testing.expect(op.* == .reset_palette);
+        }
+        try std.testing.expect(it.next() == null);
     }
 }
 
@@ -837,6 +968,55 @@ test "csi: too many params" {
 
     {
         const a = p.next('C');
+        try testing.expect(p.state == .ground);
+        try testing.expect(a[0] == null);
+        try testing.expect(a[1] == null);
+        try testing.expect(a[2] == null);
+    }
+}
+
+test "csi: sgr with up to our max parameters" {
+    for (1..MAX_PARAMS + 1) |max| {
+        var p = init();
+        _ = p.next(0x1B);
+        _ = p.next('[');
+
+        for (0..max - 1) |_| {
+            _ = p.next('1');
+            _ = p.next(';');
+        }
+        _ = p.next('2');
+
+        {
+            const a = p.next('H');
+            try testing.expect(p.state == .ground);
+            try testing.expect(a[0] == null);
+            try testing.expect(a[1].? == .csi_dispatch);
+            try testing.expect(a[2] == null);
+
+            const csi = a[1].?.csi_dispatch;
+            try testing.expectEqual(@as(usize, max), csi.params.len);
+            try testing.expectEqual(@as(u16, 2), csi.params[max - 1]);
+        }
+    }
+}
+
+test "csi: sgr beyond our max drops it" {
+    // Has to be +2 for the loops below
+    const max = MAX_PARAMS + 2;
+
+    var p = init();
+    _ = p.next(0x1B);
+    _ = p.next('[');
+
+    for (0..max - 1) |_| {
+        _ = p.next('1');
+        _ = p.next(';');
+    }
+    _ = p.next('2');
+
+    {
+        const a = p.next('H');
         try testing.expect(p.state == .ground);
         try testing.expect(a[0] == null);
         try testing.expect(a[1] == null);

@@ -15,15 +15,23 @@ pub fn build(b: *std.Build) !void {
     });
     const macos = b.dependency("macos", .{ .target = target, .optimize = optimize });
 
-    const module = b.addModule("harfbuzz", .{
-        .root_source_file = b.path("main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "freetype", .module = freetype.module("freetype") },
-            .{ .name = "macos", .module = macos.module("macos") },
-        },
-    });
+    const module = harfbuzz: {
+        const module = b.addModule("harfbuzz", .{
+            .root_source_file = b.path("main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "freetype", .module = freetype.module("freetype") },
+                .{ .name = "macos", .module = macos.module("macos") },
+            },
+        });
+
+        const options = b.addOptions();
+        options.addOption(bool, "coretext", coretext_enabled);
+        options.addOption(bool, "freetype", freetype_enabled);
+        module.addOptions("build_options", options);
+        break :harfbuzz module;
+    };
 
     // For dynamic linking, we prefer dynamic linking and to search by
     // mode first. Mode first will search all paths for a dynamic library
@@ -35,9 +43,11 @@ pub fn build(b: *std.Build) !void {
 
     const test_exe = b.addTest(.{
         .name = "test",
-        .root_source_file = b.path("main.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("main.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
 
     {
@@ -84,31 +94,30 @@ fn buildLib(b: *std.Build, module: *std.Build.Module, options: anytype) !*std.Bu
         .@"enable-libpng" = true,
     });
 
-    const upstream = b.dependency("harfbuzz", .{});
-    const lib = b.addStaticLibrary(.{
+    const lib = b.addLibrary(.{
         .name = "harfbuzz",
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        }),
+        .linkage = .static,
     });
     lib.linkLibC();
     lib.linkLibCpp();
-    lib.addIncludePath(upstream.path("src"));
-    module.addIncludePath(upstream.path("src"));
 
-    if (target.result.isDarwin()) {
-        try apple_sdk.addPaths(b, &lib.root_module);
-        try apple_sdk.addPaths(b, module);
+    if (target.result.os.tag.isDarwin()) {
+        try apple_sdk.addPaths(b, lib);
     }
 
     const dynamic_link_opts = options.dynamic_link_opts;
 
-    var flags = std.ArrayList([]const u8).init(b.allocator);
-    defer flags.deinit();
-    try flags.appendSlice(&.{
+    var flags: std.ArrayList([]const u8) = .empty;
+    defer flags.deinit(b.allocator);
+    try flags.appendSlice(b.allocator, &.{
         "-DHAVE_STDBOOL_H",
     });
     if (target.result.os.tag != .windows) {
-        try flags.appendSlice(&.{
+        try flags.appendSlice(b.allocator, &.{
             "-DHAVE_UNISTD_H",
             "-DHAVE_SYS_MMAN_H",
             "-DHAVE_PTHREAD=1",
@@ -118,7 +127,7 @@ fn buildLib(b: *std.Build, module: *std.Build.Module, options: anytype) !*std.Bu
     // Freetype
     _ = b.systemIntegrationOption("freetype", .{}); // So it shows up in help
     if (freetype_enabled) {
-        try flags.appendSlice(&.{
+        try flags.appendSlice(b.allocator, &.{
             "-DHAVE_FREETYPE=1",
 
             // Let's just assume a new freetype
@@ -133,25 +142,35 @@ fn buildLib(b: *std.Build, module: *std.Build.Module, options: anytype) !*std.Bu
             module.linkSystemLibrary("freetype2", dynamic_link_opts);
         } else {
             lib.linkLibrary(freetype.artifact("freetype"));
-            module.addIncludePath(freetype.builder.dependency("freetype", .{}).path("include"));
+
+            if (freetype.builder.lazyDependency(
+                "freetype",
+                .{},
+            )) |freetype_dep| {
+                module.addIncludePath(freetype_dep.path("include"));
+            }
         }
     }
 
     if (coretext_enabled) {
-        try flags.appendSlice(&.{"-DHAVE_CORETEXT=1"});
+        try flags.appendSlice(b.allocator, &.{"-DHAVE_CORETEXT=1"});
         lib.linkFramework("CoreText");
         module.linkFramework("CoreText", .{});
     }
 
-    lib.addCSourceFile(.{
-        .file = upstream.path("src/harfbuzz.cc"),
-        .flags = flags.items,
-    });
-    lib.installHeadersDirectory(
-        upstream.path("src"),
-        "",
-        .{ .include_extensions = &.{".h"} },
-    );
+    if (b.lazyDependency("harfbuzz", .{})) |upstream| {
+        lib.addIncludePath(upstream.path("src"));
+        module.addIncludePath(upstream.path("src"));
+        lib.addCSourceFile(.{
+            .file = upstream.path("src/harfbuzz.cc"),
+            .flags = flags.items,
+        });
+        lib.installHeadersDirectory(
+            upstream.path("src"),
+            "",
+            .{ .include_extensions = &.{".h"} },
+        );
+    }
 
     b.installArtifact(lib);
 

@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const build_config = @import("../build_config.zig");
 
@@ -16,7 +16,7 @@ pub const Diagnostic = struct {
     message: [:0]const u8,
 
     /// Write the full user-friendly diagnostic message to the writer.
-    pub fn write(self: *const Diagnostic, writer: anytype) !void {
+    pub fn format(self: *const Diagnostic, writer: *std.Io.Writer) !void {
         switch (self.location) {
             .none => {},
             .cli => |index| try writer.print("cli:{}:", .{index}),
@@ -54,14 +54,14 @@ pub const Location = union(enum) {
         line: usize,
     },
 
-    pub const Key = @typeInfo(Location).Union.tag_type.?;
+    pub const Key = @typeInfo(Location).@"union".tag_type.?;
 
     pub fn fromIter(iter: anytype, alloc: Allocator) Allocator.Error!Location {
         const Iter = t: {
             const T = @TypeOf(iter);
             break :t switch (@typeInfo(T)) {
-                .Pointer => |v| v.child,
-                .Struct => T,
+                .pointer => |v| v.child,
+                .@"struct" => T,
                 else => return .none,
             };
         };
@@ -157,11 +157,14 @@ pub const DiagnosticList = struct {
         errdefer _ = self.list.pop();
 
         if (comptime precompute_enabled) {
-            var buf = std.ArrayList(u8).init(alloc);
-            defer buf.deinit();
-            try diag.write(buf.writer());
+            var stream: std.Io.Writer.Allocating = .init(alloc);
+            defer stream.deinit();
+            diag.format(&stream.writer) catch |err| switch (err) {
+                // WriteFailed in this instance can only mean an OOM
+                error.WriteFailed => return error.OutOfMemory,
+            };
 
-            const owned: [:0]const u8 = try buf.toOwnedSliceSentinel(0);
+            const owned: [:0]const u8 = try stream.toOwnedSliceSentinel(0);
             errdefer alloc.free(owned);
 
             try self.precompute.messages.append(alloc, owned);

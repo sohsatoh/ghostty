@@ -6,12 +6,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const assert = std.debug.assert;
+const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const objc = @import("objc");
 const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
 const input = @import("../input.zig");
+const internal_os = @import("../os/main.zig");
 const renderer = @import("../renderer.zig");
 const terminal = @import("../terminal/main.zig");
 const CoreApp = @import("../App.zig");
@@ -21,6 +22,8 @@ const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
 
 const log = std.log.scoped(.embedded_window);
+
+pub const resourcesDir = internal_os.resourcesDir;
 
 pub const App = struct {
     /// Because we only expect the embedding API to be used in embedded
@@ -42,15 +45,15 @@ pub const App = struct {
 
         /// Callback called to wakeup the event loop. This should trigger
         /// a full tick of the app loop.
-        wakeup: *const fn (AppUD) callconv(.C) void,
+        wakeup: *const fn (AppUD) callconv(.c) void,
 
         /// Callback called to handle an action.
-        action: *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.C) void,
+        action: *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool,
 
         /// Read the clipboard value. The return value must be preserved
         /// by the host until the next call. If there is no valid clipboard
         /// value then this should return null.
-        read_clipboard: *const fn (SurfaceUD, c_int, *apprt.ClipboardRequest) callconv(.C) void,
+        read_clipboard: *const fn (SurfaceUD, c_int, *apprt.ClipboardRequest) callconv(.c) void,
 
         /// This may be called after a read clipboard call to request
         /// confirmation that the clipboard value is safe to read. The embedder
@@ -60,28 +63,56 @@ pub const App = struct {
             [*:0]const u8,
             *apprt.ClipboardRequest,
             apprt.ClipboardRequestType,
-        ) callconv(.C) void,
+        ) callconv(.c) void,
 
         /// Write the clipboard value.
-        write_clipboard: *const fn (SurfaceUD, [*:0]const u8, c_int, bool) callconv(.C) void,
+        write_clipboard: *const fn (
+            SurfaceUD,
+            c_int,
+            [*]const CAPI.ClipboardContent,
+            usize,
+            bool,
+        ) callconv(.c) void,
 
         /// Close the current surface given by this function.
-        close_surface: ?*const fn (SurfaceUD, bool) callconv(.C) void = null,
+        close_surface: ?*const fn (SurfaceUD, bool) callconv(.c) void = null,
     };
 
     /// This is the key event sent for ghostty_surface_key and
     /// ghostty_app_key.
     pub const KeyEvent = struct {
-        /// The three below are absolutely required.
         action: input.Action,
         mods: input.Mods,
+        consumed_mods: input.Mods,
         keycode: u32,
-
-        /// Optionally, the embedder can handle text translation and send
-        /// the text value here. If text is non-nil, it is assumed that the
-        /// embedder also handles dead key states and sets composing as necessary.
         text: ?[:0]const u8,
+        unshifted_codepoint: u32,
         composing: bool,
+
+        /// Convert a libghostty key event into a core key event.
+        fn core(self: KeyEvent) ?input.KeyEvent {
+            const text: []const u8 = if (self.text) |v| v else "";
+            const unshifted_codepoint: u21 = std.math.cast(
+                u21,
+                self.unshifted_codepoint,
+            ) orelse 0;
+
+            // We want to get the physical unmapped key to process keybinds.
+            const physical_key = keycode: for (input.keycodes.entries) |entry| {
+                if (entry.native == self.keycode) break :keycode entry.key;
+            } else .unidentified;
+
+            // Build our final key event
+            return .{
+                .action = self.action,
+                .key = physical_key,
+                .mods = self.mods,
+                .consumed_mods = self.consumed_mods,
+                .composing = self.composing,
+                .utf8 = text,
+                .unshifted_codepoint = unshifted_codepoint,
+            };
+        }
     };
 
     core_app: *CoreApp,
@@ -91,15 +122,12 @@ pub const App = struct {
     /// The configuration for the app. This is owned by this structure.
     config: Config,
 
-    /// The keymap state is used for global keybinds only. Each surface
-    /// also has its own keymap state for focused keybinds.
-    keymap_state: input.Keymap.State,
-
     pub fn init(
+        self: *App,
         core_app: *CoreApp,
         config: *const Config,
         opts: Options,
-    ) !App {
+    ) !void {
         // We have to clone the config.
         const alloc = core_app.alloc;
         var config_clone = try config.clone(alloc);
@@ -108,12 +136,11 @@ pub const App = struct {
         var keymap = try input.Keymap.init();
         errdefer keymap.deinit();
 
-        return .{
+        self.* = .{
             .core_app = core_app,
             .config = config_clone,
             .opts = opts,
             .keymap = keymap,
-            .keymap_state = .{},
         };
     }
 
@@ -128,7 +155,7 @@ pub const App = struct {
         while (it.next()) |entry| {
             switch (entry.value_ptr.*) {
                 .leader => {},
-                .leaf => |leaf| if (leaf.flags.global) return true,
+                inline .leaf, .leaf_chained => |leaf| if (leaf.flags.global) return true,
             }
         }
 
@@ -147,211 +174,6 @@ pub const App = struct {
         self.core_app.focusEvent(focused);
     }
 
-    /// Convert a C key event into a Zig key event.
-    fn coreKeyEvent(
-        self: *App,
-        target: KeyTarget,
-        event: KeyEvent,
-    ) !?input.KeyEvent {
-        const action = event.action;
-        const keycode = event.keycode;
-        const mods = event.mods;
-
-        // True if this is a key down event
-        const is_down = action == .press or action == .repeat;
-
-        // If we're on macOS and we have macos-option-as-alt enabled,
-        // then we strip the alt modifier from the mods for translation.
-        const translate_mods = translate_mods: {
-            var translate_mods = mods;
-            if ((comptime builtin.target.isDarwin()) and translate_mods.alt) {
-                // Note: the keyboardLayout() function is not super cheap
-                // so we only want to run it if alt is already pressed hence
-                // the above condition.
-                const option_as_alt: configpkg.OptionAsAlt =
-                    self.config.@"macos-option-as-alt" orelse
-                    self.keyboardLayout().detectOptionAsAlt();
-
-                const strip = switch (option_as_alt) {
-                    .false => false,
-                    .true => mods.alt,
-                    .left => mods.sides.alt == .left,
-                    .right => mods.sides.alt == .right,
-                };
-                if (strip) translate_mods.alt = false;
-            }
-
-            // On macOS we strip ctrl because UCKeyTranslate
-            // converts to the masked values (i.e. ctrl+c becomes 3)
-            // and we don't want that behavior.
-            //
-            // We also strip super because its not used for translation
-            // on macos and it results in a bad translation.
-            if (comptime builtin.target.isDarwin()) {
-                translate_mods.ctrl = false;
-                translate_mods.super = false;
-            }
-
-            break :translate_mods translate_mods;
-        };
-
-        const event_text: ?[]const u8 = event_text: {
-            // This logic only applies to macOS.
-            if (comptime builtin.os.tag != .macos) break :event_text event.text;
-
-            // If we're in a preedit state then we allow it through. This
-            // allows ctrl sequences that affect IME to work. For example,
-            // Ctrl+H deletes a character with Japanese input.
-            if (event.composing) break :event_text event.text;
-
-            // If the modifiers are ONLY "control" then we never process
-            // the event text because we want to do our own translation so
-            // we can handle ctrl+c, ctrl+z, etc.
-            //
-            // This is specifically because on macOS using the
-            // "Dvorak - QWERTY ⌘" keyboard layout, ctrl+z is translated as
-            // "/" (the physical key that is z on a qwerty keyboard). But on
-            // other layouts, ctrl+<char> is not translated by AppKit. So,
-            // we just avoid this by never allowing AppKit to translate
-            // ctrl+<char> and instead do it ourselves.
-            const ctrl_only = comptime (input.Mods{ .ctrl = true }).int();
-            break :event_text if (mods.binding().int() == ctrl_only) null else event.text;
-        };
-
-        // Translate our key using the keymap for our localized keyboard layout.
-        // We only translate for keydown events. Otherwise, we only care about
-        // the raw keycode.
-        var buf: [128]u8 = undefined;
-        const result: input.Keymap.Translation = if (is_down) translate: {
-            // If the event provided us with text, then we use this as a result
-            // and do not do manual translation.
-            const result: input.Keymap.Translation = if (event_text) |text| .{
-                .text = text,
-                .composing = event.composing,
-            } else try self.keymap.translate(
-                &buf,
-                switch (target) {
-                    .app => &self.keymap_state,
-                    .surface => |surface| &surface.keymap_state,
-                },
-                @intCast(keycode),
-                translate_mods,
-            );
-
-            // If this is a dead key, then we're composing a character and
-            // we need to set our proper preedit state if we're targeting a
-            // surface.
-            if (result.composing) {
-                switch (target) {
-                    .app => {},
-                    .surface => |surface| surface.core_surface.preeditCallback(
-                        result.text,
-                    ) catch |err| {
-                        log.err("error in preedit callback err={}", .{err});
-                        return null;
-                    },
-                }
-            } else {
-                switch (target) {
-                    .app => {},
-                    .surface => |surface| surface.core_surface.preeditCallback(null) catch |err| {
-                        log.err("error in preedit callback err={}", .{err});
-                        return null;
-                    },
-                }
-
-                // If the text is just a single non-printable ASCII character
-                // then we clear the text. We handle non-printables in the
-                // key encoder manual (such as tab, ctrl+c, etc.)
-                if (result.text.len == 1 and result.text[0] < 0x20) {
-                    break :translate .{ .composing = false, .text = "" };
-                }
-            }
-
-            break :translate result;
-        } else .{ .composing = false, .text = "" };
-
-        // UCKeyTranslate always consumes all mods, so if we have any output
-        // then we've consumed our translate mods.
-        const consumed_mods: input.Mods = if (result.text.len > 0) translate_mods else .{};
-
-        // We need to always do a translation with no modifiers at all in
-        // order to get the "unshifted_codepoint" for the key event.
-        const unshifted_codepoint: u21 = unshifted: {
-            var nomod_buf: [128]u8 = undefined;
-            var nomod_state: input.Keymap.State = .{};
-            const nomod = try self.keymap.translate(
-                &nomod_buf,
-                &nomod_state,
-                @intCast(keycode),
-                .{},
-            );
-
-            const view = std.unicode.Utf8View.init(nomod.text) catch |err| {
-                log.warn("cannot build utf8 view over text: {}", .{err});
-                break :unshifted 0;
-            };
-            var it = view.iterator();
-            break :unshifted it.nextCodepoint() orelse 0;
-        };
-
-        // log.warn("TRANSLATE: action={} keycode={x} dead={} key_len={} key={any} key_str={s} mods={}", .{
-        //     action,
-        //     keycode,
-        //     result.composing,
-        //     result.text.len,
-        //     result.text,
-        //     result.text,
-        //     mods,
-        // });
-
-        // We want to get the physical unmapped key to process keybinds.
-        const physical_key = keycode: for (input.keycodes.entries) |entry| {
-            if (entry.native == keycode) break :keycode entry.key;
-        } else .invalid;
-
-        // If the resulting text has length 1 then we can take its key
-        // and attempt to translate it to a key enum and call the key callback.
-        // If the length is greater than 1 then we're going to call the
-        // charCallback.
-        //
-        // We also only do key translation if this is not a dead key.
-        const key = if (!result.composing) key: {
-            // If our physical key is a keypad key, we use that.
-            if (physical_key.keypad()) break :key physical_key;
-
-            // A completed key. If the length of the key is one then we can
-            // attempt to translate it to a key enum and call the key
-            // callback. First try plain ASCII.
-            if (result.text.len > 0) {
-                if (input.Key.fromASCII(result.text[0])) |key| {
-                    break :key key;
-                }
-            }
-
-            // If the above doesn't work, we use the unmodified value.
-            if (std.math.cast(u8, unshifted_codepoint)) |ascii| {
-                if (input.Key.fromASCII(ascii)) |key| {
-                    break :key key;
-                }
-            }
-
-            break :key physical_key;
-        } else .invalid;
-
-        // Build our final key event
-        return .{
-            .action = action,
-            .key = key,
-            .physical_key = physical_key,
-            .mods = mods,
-            .consumed_mods = consumed_mods,
-            .composing = result.composing,
-            .utf8 = result.text,
-            .unshifted_codepoint = unshifted_codepoint,
-        };
-    }
-
     /// See CoreApp.keyEvent.
     pub fn keyEvent(
         self: *App,
@@ -359,10 +181,8 @@ pub const App = struct {
         event: KeyEvent,
     ) !bool {
         // Convert our C key event into a Zig one.
-        const input_event: input.KeyEvent = (try self.coreKeyEvent(
-            target,
-            event,
-        )) orelse return false;
+        const input_event: input.KeyEvent = event.core() orelse
+            return false;
 
         // Invoke the core Ghostty logic to handle this input.
         const effect: CoreSurface.InputEffect = switch (target) {
@@ -379,23 +199,7 @@ pub const App = struct {
         return switch (effect) {
             .closed => true,
             .ignored => false,
-            .consumed => consumed: {
-                const is_down = input_event.action == .press or
-                    input_event.action == .repeat;
-
-                if (is_down) {
-                    // If we consume the key then we want to reset the dead
-                    // key state.
-                    self.keymap_state = .{};
-
-                    switch (target) {
-                        .app => {},
-                        .surface => |surface| surface.core_surface.preeditCallback(null) catch {},
-                    }
-                }
-
-                break :consumed true;
-            },
+            .consumed => true,
         };
     }
 
@@ -403,13 +207,6 @@ pub const App = struct {
     pub fn reloadKeymap(self: *App) !void {
         // Reload the keymap
         try self.keymap.reload();
-
-        // Clear the dead key state since we changed the keymap, any
-        // dead key state is just forgotten. i.e. if you type ' on us-intl
-        // and then switch to us and type a, you'll get a rather than á.
-        for (self.core_app.surfaces.items) |surface| {
-            surface.keymap_state = .{};
-        }
     }
 
     /// Loads the keyboard layout.
@@ -445,7 +242,7 @@ pub const App = struct {
         var surface = try self.core_app.alloc.create(Surface);
         errdefer self.core_app.alloc.destroy(surface);
 
-        // Create the surface -- because windows are surfaces for glfw.
+        // Create the surface
         try surface.init(self, opts);
         errdefer surface.deinit();
 
@@ -458,34 +255,29 @@ pub const App = struct {
         self.core_app.alloc.destroy(surface);
     }
 
-    pub fn redrawSurface(self: *App, surface: *Surface) void {
-        _ = self;
-        _ = surface;
-        // No-op, we use a threaded interface so we're constantly drawing.
-    }
-
     pub fn redrawInspector(self: *App, surface: *Surface) void {
         _ = self;
         surface.queueInspectorRender();
     }
 
-    /// Perform a given action.
+    /// Perform a given action. Returns `true` if the action was able to be
+    /// performed, `false` otherwise.
     pub fn performAction(
         self: *App,
         target: apprt.Target,
         comptime action: apprt.Action.Key,
         value: apprt.Action.Value(action),
-    ) !void {
+    ) !bool {
         // Special case certain actions before they are sent to the
         // embedded apprt.
         self.performPreAction(target, action, value);
 
-        log.debug("dispatching action target={s} action={} value={}", .{
-            @tagName(target),
+        log.debug("dispatching action target={t} action={} value={any}", .{
+            target,
             action,
             value,
         });
-        self.opts.action(
+        return self.opts.action(
             self,
             target.cval(),
             @unionInit(apprt.Action, @tagName(action), value).cval(),
@@ -527,6 +319,23 @@ pub const App = struct {
             else => {},
         }
     }
+
+    /// Send the given IPC to a running Ghostty. Returns `true` if the action was
+    /// able to be performed, `false` otherwise.
+    ///
+    /// Note that this is a static function. Since this is called from a CLI app (or
+    /// some other process that is not Ghostty) there is no full-featured apprt App
+    /// to use.
+    pub fn performIpc(
+        _: Allocator,
+        _: apprt.ipc.Target,
+        comptime action: apprt.ipc.Action.Key,
+        _: apprt.ipc.Action.Value(action),
+    ) (Allocator.Error || std.posix.WriteError || apprt.ipc.Errors)!bool {
+        switch (action) {
+            .new_window => return false,
+        }
+    }
 };
 
 /// Platform-specific configuration for libghostty.
@@ -536,12 +345,12 @@ pub const Platform = union(PlatformTag) {
 
     // If our build target for libghostty is not darwin then we do
     // not include macos support at all.
-    pub const MacOS = if (builtin.target.isDarwin()) struct {
+    pub const MacOS = if (builtin.target.os.tag.isDarwin()) struct {
         /// The view to render the surface on.
         nsview: objc.Object,
     } else void;
 
-    pub const IOS = if (builtin.target.isDarwin()) struct {
+    pub const IOS = if (builtin.target.os.tag.isDarwin()) struct {
         /// The view to render the surface on.
         uiview: objc.Object,
     } else void;
@@ -587,6 +396,14 @@ pub const PlatformTag = enum(c_int) {
     ios = 2,
 };
 
+pub const EnvVar = extern struct {
+    /// The name of the environment variable.
+    key: [*:0]const u8,
+
+    /// The value of the environment variable.
+    value: [*:0]const u8,
+};
+
 pub const Surface = struct {
     app: *App,
     platform: Platform,
@@ -595,7 +412,6 @@ pub const Surface = struct {
     content_scale: apprt.ContentScale,
     size: apprt.SurfaceSize,
     cursor_pos: apprt.CursorPos,
-    keymap_state: input.Keymap.State,
     inspector: ?*Inspector = null,
 
     /// The current title of the surface. The embedded apprt saves this so
@@ -619,18 +435,36 @@ pub const Surface = struct {
         font_size: f32 = 0,
 
         /// The working directory to load into.
-        working_directory: [*:0]const u8 = "",
+        working_directory: ?[*:0]const u8 = null,
 
         /// The command to run in the new surface. If this is set then
         /// the "wait-after-command" option is also automatically set to true,
         /// since this is used for scripting.
-        command: [*:0]const u8 = "",
+        ///
+        /// This command always run in a shell (e.g. via `/bin/sh -c`),
+        /// despite Ghostty allowing directly executed commands via config.
+        /// This is a legacy thing and we should probably change it in the
+        /// future once we have a concrete use case.
+        command: ?[*:0]const u8 = null,
+
+        /// Extra environment variables to set for the surface.
+        env_vars: ?[*]EnvVar = null,
+        env_var_count: usize = 0,
+
+        /// Input to send to the command after it is started.
+        initial_input: ?[*:0]const u8 = null,
+
+        /// Wait after the command exits
+        wait_after_command: bool = false,
+
+        /// Context for the new surface
+        context: apprt.surface.NewSurfaceContext = .window,
     };
 
     pub fn init(self: *Surface, app: *App, opts: Options) !void {
         self.* = .{
             .app = app,
-            .platform = try Platform.init(opts.platform_tag, opts.platform),
+            .platform = try .init(opts.platform_tag, opts.platform),
             .userdata = opts.userdata,
             .core_surface = undefined,
             .content_scale = .{
@@ -639,7 +473,6 @@ pub const Surface = struct {
             },
             .size = .{ .width = 800, .height = 600 },
             .cursor_pos = .{ .x = -1, .y = -1 },
-            .keymap_state = .{},
         };
 
         // Add ourselves to the list of surfaces on the app.
@@ -647,44 +480,87 @@ pub const Surface = struct {
         errdefer app.core_app.deleteSurface(self);
 
         // Shallow copy the config so that we can modify it.
-        var config = try apprt.surface.newConfig(app.core_app, &app.config);
+        var config = try apprt.surface.newConfig(app.core_app, &app.config, opts.context);
         defer config.deinit();
 
         // If we have a working directory from the options then we set it.
-        const wd = std.mem.sliceTo(opts.working_directory, 0);
-        if (wd.len > 0) wd: {
-            var dir = std.fs.openDirAbsolute(wd, .{}) catch |err| {
-                log.warn(
-                    "error opening requested working directory dir={s} err={}",
-                    .{ wd, err },
-                );
-                break :wd;
-            };
-            defer dir.close();
+        if (opts.working_directory) |c_wd| {
+            const wd = std.mem.sliceTo(c_wd, 0);
+            if (wd.len > 0) wd: {
+                var dir = std.fs.openDirAbsolute(wd, .{}) catch |err| {
+                    log.warn(
+                        "error opening requested working directory dir={s} err={}",
+                        .{ wd, err },
+                    );
+                    break :wd;
+                };
+                defer dir.close();
 
-            const stat = dir.stat() catch |err| {
-                log.warn(
-                    "failed to stat requested working directory dir={s} err={}",
-                    .{ wd, err },
-                );
-                break :wd;
-            };
+                const stat = dir.stat() catch |err| {
+                    log.warn(
+                        "failed to stat requested working directory dir={s} err={}",
+                        .{ wd, err },
+                    );
+                    break :wd;
+                };
 
-            if (stat.kind != .directory) {
-                log.warn(
-                    "requested working directory is not a directory dir={s}",
-                    .{wd},
-                );
-                break :wd;
+                if (stat.kind != .directory) {
+                    log.warn(
+                        "requested working directory is not a directory dir={s}",
+                        .{wd},
+                    );
+                    break :wd;
+                }
+
+                config.@"working-directory" = wd;
             }
-
-            config.@"working-directory" = wd;
         }
 
         // If we have a command from the options then we set it.
-        const cmd = std.mem.sliceTo(opts.command, 0);
-        if (cmd.len > 0) {
-            config.command = cmd;
+        if (opts.command) |c_command| {
+            const cmd = std.mem.sliceTo(c_command, 0);
+            if (cmd.len > 0) {
+                config.command = .{ .shell = cmd };
+                config.@"wait-after-command" = true;
+            }
+        }
+
+        // Apply any environment variables that were requested.
+        if (opts.env_var_count > 0) {
+            const alloc = config.arenaAlloc();
+            for (opts.env_vars.?[0..opts.env_var_count]) |env_var| {
+                const key = std.mem.sliceTo(env_var.key, 0);
+                const value = std.mem.sliceTo(env_var.value, 0);
+                try config.env.map.put(
+                    alloc,
+                    try alloc.dupeZ(u8, key),
+                    try alloc.dupeZ(u8, value),
+                );
+            }
+        }
+
+        // If we have an initial input then we set it.
+        if (opts.initial_input) |c_input| {
+            const alloc = config.arenaAlloc();
+
+            // We need to escape the string because the "raw" field
+            // expects a Zig string.
+            var buf: std.Io.Writer.Allocating = .init(alloc);
+            defer buf.deinit();
+            try std.zig.stringEscape(
+                std.mem.sliceTo(c_input, 0),
+                &buf.writer,
+            );
+
+            config.input.list.clearRetainingCapacity();
+            try config.input.list.append(
+                alloc,
+                .{ .raw = try buf.toOwnedSliceSentinel(0) },
+            );
+        }
+
+        // Wait after command
+        if (opts.wait_after_command) {
             config.@"wait-after-command" = true;
         }
 
@@ -730,7 +606,7 @@ pub const Surface = struct {
         const alloc = self.app.core_app.alloc;
         const inspector = try alloc.create(Inspector);
         errdefer alloc.destroy(inspector);
-        inspector.* = try Inspector.init(self);
+        inspector.* = try .init(self);
         self.inspector = inspector;
         return inspector;
     }
@@ -741,6 +617,14 @@ pub const Surface = struct {
             self.app.core_app.alloc.destroy(v);
             self.inspector = null;
         }
+    }
+
+    pub fn core(self: *Surface) *CoreSurface {
+        return &self.core_surface;
+    }
+
+    pub fn rtApp(self: *const Surface) *App {
+        return self.app;
     }
 
     pub fn close(self: *const Surface, process_alive: bool) void {
@@ -778,7 +662,7 @@ pub const Surface = struct {
         self: *Surface,
         clipboard_type: apprt.Clipboard,
         state: apprt.ClipboardRequest,
-    ) !void {
+    ) !bool {
         // We need to allocate to get a pointer to store our clipboard request
         // so that it is stable until the read_clipboard callback and call
         // complete_clipboard_request. This sucks but clipboard requests aren't
@@ -793,6 +677,10 @@ pub const Surface = struct {
             @intCast(@intFromEnum(clipboard_type)),
             state_ptr,
         );
+
+        // Embedded apprt can't synchronously check clipboard content types,
+        // so we always return true to indicate the request was started.
+        return true;
     }
 
     fn completeClipboardRequest(
@@ -831,27 +719,29 @@ pub const Surface = struct {
         alloc.destroy(state);
     }
 
-    pub fn setClipboardString(
+    pub fn setClipboard(
         self: *const Surface,
-        val: [:0]const u8,
         clipboard_type: apprt.Clipboard,
+        contents: []const apprt.ClipboardContent,
         confirm: bool,
     ) !void {
+        const alloc = self.app.core_app.alloc;
+        const array = try alloc.alloc(CAPI.ClipboardContent, contents.len);
+        defer alloc.free(array);
+        for (contents, 0..) |content, i| {
+            array[i] = .{
+                .mime = content.mime,
+                .data = content.data,
+            };
+        }
+
         self.app.opts.write_clipboard(
             self.userdata,
-            val.ptr,
             @intCast(@intFromEnum(clipboard_type)),
+            array.ptr,
+            array.len,
             confirm,
         );
-    }
-
-    pub fn setShouldClose(self: *Surface) void {
-        _ = self;
-    }
-
-    pub fn shouldClose(self: *const Surface) bool {
-        _ = self;
-        return false;
     }
 
     pub fn getCursorPos(self: *const Surface) !apprt.CursorPos {
@@ -975,6 +865,13 @@ pub const Surface = struct {
         };
     }
 
+    pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) void {
+        _ = self.core_surface.preeditCallback(preedit_) catch |err| {
+            log.err("error in preedit callback err={}", .{err});
+            return;
+        };
+    }
+
     pub fn textCallback(self: *Surface, text: []const u8) void {
         _ = self.core_surface.textCallback(text) catch |err| {
             log.err("error in key callback err={}", .{err});
@@ -997,7 +894,7 @@ pub const Surface = struct {
     }
 
     fn queueInspectorRender(self: *Surface) void {
-        self.app.performAction(
+        _ = self.app.performAction(
             .{ .surface = &self.core_surface },
             .render_inspector,
             {},
@@ -1007,15 +904,55 @@ pub const Surface = struct {
         };
     }
 
-    pub fn newSurfaceOptions(self: *const Surface) apprt.Surface.Options {
+    pub fn newSurfaceOptions(self: *const Surface, context: apprt.surface.NewSurfaceContext) apprt.Surface.Options {
         const font_size: f32 = font_size: {
             if (!self.app.config.@"window-inherit-font-size") break :font_size 0;
             break :font_size self.core_surface.font_size.points;
         };
 
+        const working_directory: ?[*:0]const u8 = wd: {
+            if (!apprt.surface.shouldInheritWorkingDirectory(context, &self.app.config)) break :wd null;
+            const cwd = self.core_surface.pwd(self.app.core_app.alloc) catch null orelse break :wd null;
+            defer self.app.core_app.alloc.free(cwd);
+            break :wd self.app.core_app.alloc.dupeZ(u8, cwd) catch null;
+        };
+
         return .{
             .font_size = font_size,
+            .working_directory = working_directory,
+            .context = context,
         };
+    }
+
+    pub fn defaultTermioEnv(self: *const Surface) !std.process.EnvMap {
+        const alloc = self.app.core_app.alloc;
+        var env = try internal_os.getEnvMap(alloc);
+        errdefer env.deinit();
+
+        if (comptime builtin.target.os.tag.isDarwin()) {
+            if (env.get("__XCODE_BUILT_PRODUCTS_DIR_PATHS") != null) {
+                env.remove("__XCODE_BUILT_PRODUCTS_DIR_PATHS");
+                env.remove("__XPC_DYLD_LIBRARY_PATH");
+                env.remove("DYLD_FRAMEWORK_PATH");
+                env.remove("DYLD_INSERT_LIBRARIES");
+                env.remove("DYLD_LIBRARY_PATH");
+                env.remove("LD_LIBRARY_PATH");
+                env.remove("SECURITYSESSIONID");
+                env.remove("XPC_SERVICE_NAME");
+            }
+
+            // Remove this so that running `ghostty` within Ghostty works.
+            env.remove("GHOSTTY_MAC_LAUNCH_SOURCE");
+
+            // If we were launched from the desktop then we want to
+            // remove the LANGUAGE env var so that we don't inherit
+            // our translation settings for Ghostty. If we aren't from
+            // the desktop then we didn't set our LANGUAGE var so we
+            // don't need to remove it.
+            if (internal_os.launchedFromDesktop()) env.remove("LANGUAGE");
+        }
+
+        return env;
     }
 
     /// The cursor position from the host directly is in screen coordinates but
@@ -1029,12 +966,11 @@ pub const Surface = struct {
 /// Inspector is the state required for the terminal inspector. A terminal
 /// inspector is 1:1 with a Surface.
 pub const Inspector = struct {
-    const cimgui = @import("cimgui");
+    const cimgui = @import("dcimgui");
 
     surface: *Surface,
     ig_ctx: *cimgui.c.ImGuiContext,
     backend: ?Backend = null,
-    keymap_state: input.Keymap.State = .{},
     content_scale: f64 = 1,
 
     /// Our previous instant used to calculate delta time for animations.
@@ -1045,16 +981,16 @@ pub const Inspector = struct {
 
         pub fn deinit(self: Backend) void {
             switch (self) {
-                .metal => if (builtin.target.isDarwin()) cimgui.ImGui_ImplMetal_Shutdown(),
+                .metal => if (builtin.target.os.tag.isDarwin()) cimgui.ImGui_ImplMetal_Shutdown(),
             }
         }
     };
 
     pub fn init(surface: *Surface) !Inspector {
-        const ig_ctx = cimgui.c.igCreateContext(null) orelse return error.OutOfMemory;
-        errdefer cimgui.c.igDestroyContext(ig_ctx);
-        cimgui.c.igSetCurrentContext(ig_ctx);
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        const ig_ctx = cimgui.c.ImGui_CreateContext(null) orelse return error.OutOfMemory;
+        errdefer cimgui.c.ImGui_DestroyContext(ig_ctx);
+        cimgui.c.ImGui_SetCurrentContext(ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         io.BackendPlatformName = "ghostty_embedded";
 
         // Setup our core inspector
@@ -1071,9 +1007,9 @@ pub const Inspector = struct {
 
     pub fn deinit(self: *Inspector) void {
         self.surface.core_surface.deactivateInspector();
-        cimgui.c.igSetCurrentContext(self.ig_ctx);
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
         if (self.backend) |v| v.deinit();
-        cimgui.c.igDestroyContext(self.ig_ctx);
+        cimgui.c.ImGui_DestroyContext(self.ig_ctx);
     }
 
     /// Queue a render for the next frame.
@@ -1084,7 +1020,7 @@ pub const Inspector = struct {
     /// Initialize the inspector for a metal backend.
     pub fn initMetal(self: *Inspector, device: objc.Object) bool {
         defer device.msgSend(void, objc.sel("release"), .{});
-        cimgui.c.igSetCurrentContext(self.ig_ctx);
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
 
         if (self.backend) |v| {
             v.deinit();
@@ -1119,7 +1055,7 @@ pub const Inspector = struct {
         for (0..2) |_| {
             cimgui.ImGui_ImplMetal_NewFrame(desc.value);
             try self.newFrame();
-            cimgui.c.igNewFrame();
+            cimgui.c.ImGui_NewFrame();
 
             // Build our UI
             render: {
@@ -1129,7 +1065,7 @@ pub const Inspector = struct {
             }
 
             // Render
-            cimgui.c.igRender();
+            cimgui.c.ImGui_Render();
         }
 
         // MTLRenderCommandEncoder
@@ -1140,7 +1076,7 @@ pub const Inspector = struct {
         );
         defer encoder.msgSend(void, objc.sel("endEncoding"), .{});
         cimgui.ImGui_ImplMetal_RenderDrawData(
-            cimgui.c.igGetDrawData(),
+            cimgui.c.ImGui_GetDrawData(),
             command_buffer.value,
             encoder.value,
         );
@@ -1148,22 +1084,24 @@ pub const Inspector = struct {
 
     pub fn updateContentScale(self: *Inspector, x: f64, y: f64) void {
         _ = y;
-        cimgui.c.igSetCurrentContext(self.ig_ctx);
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
 
         // Cache our scale because we use it for cursor position calculations.
         self.content_scale = x;
 
-        // Setup a new style and scale it appropriately.
-        const style = cimgui.c.ImGuiStyle_ImGuiStyle();
-        defer cimgui.c.ImGuiStyle_destroy(style);
-        cimgui.c.ImGuiStyle_ScaleAllSizes(style, @floatCast(x));
-        const active_style = cimgui.c.igGetStyle();
-        active_style.* = style.*;
+        // Setup a new style and scale it appropriately. We must use the
+        // ImGuiStyle constructor to get proper default values (e.g.,
+        // CurveTessellationTol) rather than zero-initialized values.
+        var style: cimgui.c.ImGuiStyle = undefined;
+        cimgui.ext.ImGuiStyle_ImGuiStyle(&style);
+        cimgui.c.ImGuiStyle_ScaleAllSizes(&style, @floatCast(x));
+        const active_style = cimgui.c.ImGui_GetStyle();
+        active_style.* = style;
     }
 
     pub fn updateSize(self: *Inspector, width: u32, height: u32) void {
-        cimgui.c.igSetCurrentContext(self.ig_ctx);
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         io.DisplaySize = .{ .x = @floatFromInt(width), .y = @floatFromInt(height) };
     }
 
@@ -1176,8 +1114,8 @@ pub const Inspector = struct {
         _ = mods;
 
         self.queueRender();
-        cimgui.c.igSetCurrentContext(self.ig_ctx);
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
 
         const imgui_button = switch (button) {
             .left => cimgui.c.ImGuiMouseButton_Left,
@@ -1198,8 +1136,8 @@ pub const Inspector = struct {
         _ = mods;
 
         self.queueRender();
-        cimgui.c.igSetCurrentContext(self.ig_ctx);
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         cimgui.c.ImGuiIO_AddMouseWheelEvent(
             io,
             @floatCast(xoff),
@@ -1209,8 +1147,8 @@ pub const Inspector = struct {
 
     pub fn cursorPosCallback(self: *Inspector, x: f64, y: f64) void {
         self.queueRender();
-        cimgui.c.igSetCurrentContext(self.ig_ctx);
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         cimgui.c.ImGuiIO_AddMousePosEvent(
             io,
             @floatCast(x * self.content_scale),
@@ -1220,15 +1158,15 @@ pub const Inspector = struct {
 
     pub fn focusCallback(self: *Inspector, focused: bool) void {
         self.queueRender();
-        cimgui.c.igSetCurrentContext(self.ig_ctx);
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         cimgui.c.ImGuiIO_AddFocusEvent(io, focused);
     }
 
     pub fn textCallback(self: *Inspector, text: [:0]const u8) void {
         self.queueRender();
-        cimgui.c.igSetCurrentContext(self.ig_ctx);
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
         cimgui.c.ImGuiIO_AddInputCharactersUTF8(io, text.ptr);
     }
 
@@ -1239,8 +1177,8 @@ pub const Inspector = struct {
         mods: input.Mods,
     ) !void {
         self.queueRender();
-        cimgui.c.igSetCurrentContext(self.ig_ctx);
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
 
         // Update all our modifiers
         cimgui.c.ImGuiIO_AddKeyEvent(io, cimgui.c.ImGuiKey_LeftShift, mods.shift);
@@ -1259,7 +1197,7 @@ pub const Inspector = struct {
     }
 
     fn newFrame(self: *Inspector) !void {
-        const io: *cimgui.c.ImGuiIO = cimgui.c.igGetIO();
+        const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
 
         // Determine our delta time
         const now = try std.time.Instant.now();
@@ -1280,11 +1218,13 @@ pub const CAPI = struct {
     const KeyEvent = extern struct {
         action: input.Action,
         mods: c_int,
+        consumed_mods: c_int,
         keycode: u32,
         text: ?[*:0]const u8,
+        unshifted_codepoint: u32,
         composing: bool,
 
-        /// Convert to surface key event.
+        /// Convert to Zig key event.
         fn keyEvent(self: KeyEvent) App.KeyEvent {
             return .{
                 .action = self.action,
@@ -1292,18 +1232,16 @@ pub const CAPI = struct {
                     input.Mods.Backing,
                     @truncate(@as(c_uint, @bitCast(self.mods))),
                 )),
+                .consumed_mods = @bitCast(@as(
+                    input.Mods.Backing,
+                    @truncate(@as(c_uint, @bitCast(self.consumed_mods))),
+                )),
                 .keycode = self.keycode,
                 .text = if (self.text) |ptr| std.mem.sliceTo(ptr, 0) else null,
+                .unshifted_codepoint = self.unshifted_codepoint,
                 .composing = self.composing,
             };
         }
-    };
-
-    const Selection = extern struct {
-        tl_x_px: f64,
-        tl_y_px: f64,
-        offset_start: u32,
-        offset_len: u32,
     };
 
     const SurfaceSize = extern struct {
@@ -1315,10 +1253,114 @@ pub const CAPI = struct {
         cell_height_px: u32,
     };
 
+    // ghostty_clipboard_content_s
+    const ClipboardContent = extern struct {
+        mime: [*:0]const u8,
+        data: [*:0]const u8,
+    };
+
+    // ghostty_text_s
+    const Text = extern struct {
+        tl_px_x: f64,
+        tl_px_y: f64,
+        offset_start: u32,
+        offset_len: u32,
+        text: ?[*:0]const u8,
+        text_len: usize,
+
+        pub fn deinit(self: *Text) void {
+            if (self.text) |ptr| {
+                global.alloc.free(ptr[0..self.text_len :0]);
+            }
+        }
+    };
+
+    // ghostty_point_s
+    const Point = extern struct {
+        tag: Tag,
+        coord_tag: CoordTag,
+        x: u32,
+        y: u32,
+
+        const Tag = enum(c_int) {
+            active = 0,
+            viewport = 1,
+            screen = 2,
+            history = 3,
+        };
+
+        const CoordTag = enum(c_int) {
+            exact = 0,
+            top_left = 1,
+            bottom_right = 2,
+        };
+
+        fn pin(
+            self: Point,
+            screen: *const terminal.Screen,
+        ) ?terminal.Pin {
+            // The core point tag.
+            const tag: terminal.point.Tag = switch (self.tag) {
+                inline else => |tag| @field(
+                    terminal.point.Tag,
+                    @tagName(tag),
+                ),
+            };
+
+            // Clamp our point to the screen bounds.
+            const clamped_x = @min(self.x, screen.pages.cols -| 1);
+            const clamped_y = @min(self.y, screen.pages.rows -| 1);
+
+            return switch (self.coord_tag) {
+                // Exact coordinates require a specific pin.
+                .exact => exact: {
+                    const pt_x = std.math.cast(
+                        terminal.size.CellCountInt,
+                        clamped_x,
+                    ) orelse std.math.maxInt(terminal.size.CellCountInt);
+
+                    const pt: terminal.Point = switch (tag) {
+                        inline else => |v| @unionInit(
+                            terminal.Point,
+                            @tagName(v),
+                            .{ .x = pt_x, .y = clamped_y },
+                        ),
+                    };
+
+                    break :exact screen.pages.pin(pt) orelse null;
+                },
+
+                .top_left => screen.pages.getTopLeft(tag),
+
+                .bottom_right => screen.pages.getBottomRight(tag),
+            };
+        }
+    };
+
+    // ghostty_selection_s
+    const Selection = extern struct {
+        tl: Point,
+        br: Point,
+        rectangle: bool,
+
+        fn core(
+            self: Selection,
+            screen: *const terminal.Screen,
+        ) ?terminal.Selection {
+            return .{
+                .bounds = .{ .untracked = .{
+                    .start = self.tl.pin(screen) orelse return null,
+                    .end = self.br.pin(screen) orelse return null,
+                } },
+                .rectangle = self.rectangle,
+            };
+        }
+    };
+
     // Reference the conditional exports based on target platform
     // so they're included in the C API.
     comptime {
-        if (builtin.target.isDarwin()) {
+        if (builtin.target.os.tag.isDarwin()) {
             _ = Darwin;
         }
     }
@@ -1338,13 +1380,13 @@ pub const CAPI = struct {
         opts: *const apprt.runtime.App.Options,
         config: *const Config,
     ) !*App {
-        var core_app = try CoreApp.create(global.alloc);
+        const core_app = try CoreApp.create(global.alloc);
         errdefer core_app.destroy();
 
         // Create our runtime app
         var app = try global.alloc.create(App);
         errdefer global.alloc.destroy(app);
-        app.* = try App.init(core_app, config, opts.*);
+        try app.init(core_app, config, opts.*);
         errdefer app.terminate();
 
         return app;
@@ -1399,13 +1441,7 @@ pub const CAPI = struct {
         app: *App,
         event: KeyEvent,
     ) bool {
-        const core_event = app.coreKeyEvent(
-            .app,
-            event.keyEvent(),
-        ) catch |err| {
-            log.warn("error processing key event err={}", .{err});
-            return false;
-        } orelse {
+        const core_event = event.keyEvent().core() orelse {
             log.warn("error processing key event", .{});
             return false;
         };
@@ -1424,7 +1460,7 @@ pub const CAPI = struct {
 
     /// Open the configuration.
     export fn ghostty_app_open_config(v: *App) void {
-        v.performAction(.app, .open_config, {}) catch |err| {
+        _ = v.performAction(.app, .open_config, {}) catch |err| {
             log.err("error reloading config err={}", .{err});
             return;
         };
@@ -1506,8 +1542,11 @@ pub const CAPI = struct {
     }
 
     /// Returns the config to use for surfaces that inherit from this one.
-    export fn ghostty_surface_inherited_config(surface: *Surface) Surface.Options {
-        return surface.newSurfaceOptions();
+    export fn ghostty_surface_inherited_config(
+        surface: *Surface,
+        source: apprt.surface.NewSurfaceContext,
+    ) Surface.Options {
+        return surface.newSurfaceOptions(source);
     }
 
     /// Update the configuration to the provided config for only this surface.
@@ -1526,28 +1565,90 @@ pub const CAPI = struct {
         return surface.core_surface.needsConfirmQuit();
     }
 
+    /// Returns true if the surface process has exited.
+    export fn ghostty_surface_process_exited(surface: *Surface) bool {
+        return surface.core_surface.child_exited;
+    }
+
     /// Returns true if the surface has a selection.
     export fn ghostty_surface_has_selection(surface: *Surface) bool {
         return surface.core_surface.hasSelection();
     }
 
-    /// Copies the surface selection text into the provided buffer and
-    /// returns the copied size. If the buffer is too small, there is no
-    /// selection, or there is an error, then 0 is returned.
-    export fn ghostty_surface_selection(surface: *Surface, buf: [*]u8, cap: usize) usize {
-        const selection_ = surface.core_surface.selectionString(global.alloc) catch |err| {
-            log.warn("error getting selection err={}", .{err});
-            return 0;
+    /// Same as ghostty_surface_read_text but reads from the user selection,
+    /// if any.
+    export fn ghostty_surface_read_selection(
+        surface: *Surface,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+        core_surface.renderer_state.mutex.lock();
+        defer core_surface.renderer_state.mutex.unlock();
+
+        // If we don't have a selection, do nothing.
+        const core_sel = core_surface.io.terminal.screens.active.selection orelse return false;
+
+        // Read the text from the selection.
+        return readTextLocked(surface, core_sel, result);
+    }
+
+    /// Read some arbitrary text from the surface.
+    ///
+    /// This is an expensive operation so it shouldn't be called too
+    /// often. We recommend that callers cache the result and throttle
+    /// calls to this function.
+    export fn ghostty_surface_read_text(
+        surface: *Surface,
+        sel: Selection,
+        result: *Text,
+    ) bool {
+        surface.core_surface.renderer_state.mutex.lock();
+        defer surface.core_surface.renderer_state.mutex.unlock();
+
+        const core_sel = sel.core(
+            surface.core_surface.renderer_state.terminal.screens.active,
+        ) orelse return false;
+
+        return readTextLocked(surface, core_sel, result);
+    }
+
+    fn readTextLocked(
+        surface: *Surface,
+        core_sel: terminal.Selection,
+        result: *Text,
+    ) bool {
+        const core_surface = &surface.core_surface;
+
+        // Get our text directly from the core surface.
+        const text = core_surface.dumpTextLocked(
+            global.alloc,
+            core_sel,
+        ) catch |err| {
+            log.warn("error reading text err={}", .{err});
+            return false;
         };
-        const selection = selection_ orelse return 0;
-        defer global.alloc.free(selection);
 
-        // If the buffer is too small, return no selection.
-        if (selection.len > cap) return 0;
+        const vp: CoreSurface.Text.Viewport = text.viewport orelse .{
+            .tl_px_x = -1,
+            .tl_px_y = -1,
+            .offset_start = 0,
+            .offset_len = 0,
+        };
 
-        // Copy into the buffer and return the length
-        @memcpy(buf[0..selection.len], selection);
-        return selection.len;
+        result.* = .{
+            .tl_px_x = vp.tl_px_x,
+            .tl_px_y = vp.tl_px_y,
+            .offset_start = vp.offset_start,
+            .offset_len = vp.offset_len,
+            .text = text.text.ptr,
+            .text_len = text.text.len,
+        };
+
+        return true;
+    }
+
+    export fn ghostty_surface_free_text(ptr: *Text) void {
+        ptr.deinit();
     }
 
     /// Tell the surface that it needs to schedule a render
@@ -1650,19 +1751,18 @@ pub const CAPI = struct {
     export fn ghostty_surface_key_is_binding(
         surface: *Surface,
         event: KeyEvent,
+        c_flags: ?*input.Binding.Flags.C,
     ) bool {
-        const core_event = surface.app.coreKeyEvent(
-            .{ .surface = surface },
-            event.keyEvent(),
-        ) catch |err| {
-            log.warn("error processing key event err={}", .{err});
-            return false;
-        } orelse {
+        const core_event = event.keyEvent().core() orelse {
             log.warn("error processing key event", .{});
             return false;
         };
 
-        return surface.core_surface.keyEventIsBinding(core_event);
+        const flags = surface.core_surface.keyEventIsBinding(
+            core_event,
+        ) orelse return false;
+        if (c_flags) |ptr| ptr.* = flags.cval();
+        return true;
     }
 
     /// Send raw text to the terminal. This is treated like a paste
@@ -1674,6 +1774,16 @@ pub const CAPI = struct {
         len: usize,
     ) void {
         surface.textCallback(ptr[0..len]);
+    }
+
+    /// Set the preedit text for the surface. This is used for IME
+    /// composition. If the length is 0, then the preedit text is cleared.
+    export fn ghostty_surface_preedit(
+        surface: *Surface,
+        ptr: [*]const u8,
+        len: usize,
+    ) void {
+        surface.preeditCallback(if (len == 0) null else ptr[0..len]);
     }
 
     /// Returns true if the surface currently has mouse capturing
@@ -1748,10 +1858,18 @@ pub const CAPI = struct {
         surface.mousePressureCallback(stage, pressure);
     }
 
-    export fn ghostty_surface_ime_point(surface: *Surface, x: *f64, y: *f64) void {
+    export fn ghostty_surface_ime_point(
+        surface: *Surface,
+        x: *f64,
+        y: *f64,
+        width: *f64,
+        height: *f64,
+    ) void {
         const pos = surface.core_surface.imePoint();
         x.* = pos.x;
         y.* = pos.y;
+        width.* = pos.width;
+        height.* = pos.height;
     }
 
     /// Request that the surface become closed. This will go through the
@@ -1762,7 +1880,7 @@ pub const CAPI = struct {
 
     /// Request that the surface split in the given direction.
     export fn ghostty_surface_split(ptr: *Surface, direction: apprt.action.SplitDirection) void {
-        ptr.app.performAction(
+        _ = ptr.app.performAction(
             .{ .surface = &ptr.core_surface },
             .new_split,
             direction,
@@ -1777,7 +1895,7 @@ pub const CAPI = struct {
         ptr: *Surface,
         direction: apprt.action.GotoSplit,
     ) void {
-        ptr.app.performAction(
+        _ = ptr.app.performAction(
             .{ .surface = &ptr.core_surface },
             .goto_split,
             direction,
@@ -1796,7 +1914,7 @@ pub const CAPI = struct {
         direction: apprt.action.ResizeSplit.Direction,
         amount: u16,
     ) void {
-        ptr.app.performAction(
+        _ = ptr.app.performAction(
             .{ .surface = &ptr.core_surface },
             .resize_split,
             .{ .direction = direction, .amount = amount },
@@ -1808,7 +1926,7 @@ pub const CAPI = struct {
 
     /// Equalize the size of all splits in the current window.
     export fn ghostty_surface_split_equalize(ptr: *Surface) void {
-        ptr.app.performAction(
+        _ = ptr.app.performAction(
             .{ .surface = &ptr.core_surface },
             .equalize_splits,
             {},
@@ -1830,12 +1948,10 @@ pub const CAPI = struct {
             return false;
         };
 
-        _ = ptr.core_surface.performBindingAction(action) catch |err| {
-            log.err("error performing binding action action={} err={}", .{ action, err });
+        return ptr.core_surface.performBindingAction(action) catch |err| {
+            log.err("error performing binding action action={f} err={}", .{ action, err });
             return false;
         };
-
-        return true;
     }
 
     /// Complete a clipboard read request started via the read callback.
@@ -2029,24 +2145,15 @@ pub const CAPI = struct {
         /// This does not modify the selection active on the surface (if any).
         export fn ghostty_surface_quicklook_word(
             ptr: *Surface,
-            buf: [*]u8,
-            cap: usize,
-            info: *Selection,
-        ) usize {
+            result: *Text,
+        ) bool {
             const surface = &ptr.core_surface;
             surface.renderer_state.mutex.lock();
             defer surface.renderer_state.mutex.unlock();
 
-            // To make everything in this function easier, we modify the
-            // selection to be the word under the cursor and call normal APIs.
-            // We restore the old selection so it isn't ever changed. Since we hold
-            // the renderer mutex it'll never show up in a frame.
-            const prev = surface.io.terminal.screen.selection;
-            defer surface.io.terminal.screen.selection = prev;
-
             // Get our word selection
             const sel = sel: {
-                const screen = &surface.renderer_state.terminal.screen;
+                const screen: *terminal.Screen = surface.renderer_state.terminal.screens.active;
                 const pos = try ptr.getCursorPos();
                 const pt_viewport = surface.posToViewport(pos.x, pos.y);
                 const pin = screen.pages.pin(.{
@@ -2056,49 +2163,17 @@ pub const CAPI = struct {
                     },
                 }) orelse {
                     if (comptime std.debug.runtime_safety) unreachable;
-                    return 0;
+                    return false;
                 };
-                break :sel surface.io.terminal.screen.selectWord(pin) orelse return 0;
+                break :sel surface.io.terminal.screens.active.selectWord(pin) orelse return false;
             };
 
-            // Set the selection
-            surface.io.terminal.screen.selection = sel;
-
-            // No we call normal functions. These require that the lock
-            // is unlocked. This may cause a frame flicker with the fake
-            // selection but I think the lack of new complexity is worth it
-            // for now.
-            {
-                surface.renderer_state.mutex.unlock();
-                defer surface.renderer_state.mutex.lock();
-                const len = ghostty_surface_selection(ptr, buf, cap);
-                if (!ghostty_surface_selection_info(ptr, info)) return 0;
-                return len;
-            }
-        }
-
-        /// This returns the selection metadata for the current selection.
-        /// This will return false if there is no selection or the
-        /// selection is not fully contained in the viewport (since the
-        /// metadata is all about that).
-        export fn ghostty_surface_selection_info(
-            ptr: *Surface,
-            info: *Selection,
-        ) bool {
-            const sel = ptr.core_surface.selectionInfo() orelse
-                return false;
-
-            info.* = .{
-                .tl_x_px = sel.tl_x_px,
-                .tl_y_px = sel.tl_y_px,
-                .offset_start = sel.offset_start,
-                .offset_len = sel.offset_len,
-            };
-            return true;
+            // Read the selection
+            return readTextLocked(ptr, sel, result);
         }
 
         export fn ghostty_inspector_metal_init(ptr: *Inspector, device: objc.c.id) bool {
-            return ptr.initMetal(objc.Object.fromId(device));
+            return ptr.initMetal(.fromId(device));
         }
 
         export fn ghostty_inspector_metal_render(
@@ -2107,8 +2182,8 @@ pub const CAPI = struct {
             descriptor: objc.c.id,
         ) void {
             return ptr.renderMetal(
-                objc.Object.fromId(command_buffer),
-                objc.Object.fromId(descriptor),
+                .fromId(command_buffer),
+                .fromId(descriptor),
             ) catch |err| {
                 log.err("error rendering inspector err={}", .{err});
                 return;

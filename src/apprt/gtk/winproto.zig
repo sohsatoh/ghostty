@@ -1,10 +1,13 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const Allocator = std.mem.Allocator;
-const c = @import("c.zig").c;
+
+const gdk = @import("gdk");
+
 const Config = @import("../../config.zig").Config;
 const input = @import("../../input.zig");
 const key = @import("key.zig");
+const ApprtWindow = @import("class/window.zig").Window;
 
 pub const noop = @import("winproto/noop.zig");
 pub const x11 = @import("winproto/x11.zig");
@@ -25,11 +28,11 @@ pub const App = union(Protocol) {
 
     pub fn init(
         alloc: Allocator,
-        gdk_display: *c.GdkDisplay,
+        gdk_display: *gdk.Display,
         app_id: [:0]const u8,
         config: *const Config,
     ) !App {
-        inline for (@typeInfo(App).Union.fields) |field| {
+        inline for (@typeInfo(App).@"union".fields) |field| {
             if (try field.type.init(
                 alloc,
                 gdk_display,
@@ -51,12 +54,29 @@ pub const App = union(Protocol) {
 
     pub fn eventMods(
         self: *App,
-        device: ?*c.GdkDevice,
-        gtk_mods: c.GdkModifierType,
+        device: ?*gdk.Device,
+        gtk_mods: gdk.ModifierType,
     ) input.Mods {
         return switch (self.*) {
             inline else => |*v| v.eventMods(device, gtk_mods),
         } orelse key.translateMods(gtk_mods);
+    }
+
+    pub fn supportsQuickTerminal(self: App) bool {
+        return switch (self) {
+            inline else => |v| v.supportsQuickTerminal(),
+        };
+    }
+
+    /// Set up necessary support for the quick terminal that must occur
+    /// *before* the window-level winproto object is created.
+    ///
+    /// Only has an effect on the Wayland backend, where the gtk4-layer-shell
+    /// library is initialized.
+    pub fn initQuickTerminal(self: *App, apprt_window: *ApprtWindow) !void {
+        switch (self.*) {
+            inline else => |*v| try v.initQuickTerminal(apprt_window),
+        }
     }
 };
 
@@ -74,12 +94,11 @@ pub const Window = union(Protocol) {
     pub fn init(
         alloc: Allocator,
         app: *App,
-        window: *c.GtkWindow,
-        config: *const Config,
+        apprt_window: *ApprtWindow,
     ) !Window {
         return switch (app.*) {
             inline else => |*v, tag| {
-                inline for (@typeInfo(Window).Union.fields) |field| {
+                inline for (@typeInfo(Window).@"union".fields) |field| {
                     if (comptime std.mem.eql(
                         u8,
                         field.name,
@@ -90,8 +109,7 @@ pub const Window = union(Protocol) {
                         try field.type.init(
                             alloc,
                             v,
-                            window,
-                            config,
+                            apprt_window,
                         ),
                     );
                 }
@@ -111,15 +129,6 @@ pub const Window = union(Protocol) {
         }
     }
 
-    pub fn updateConfigEvent(
-        self: *Window,
-        config: *const Config,
-    ) !void {
-        switch (self.*) {
-            inline else => |*v| try v.updateConfigEvent(config),
-        }
-    }
-
     pub fn syncAppearance(self: *Window) !void {
         switch (self.*) {
             inline else => |*v| try v.syncAppearance(),
@@ -130,5 +139,17 @@ pub const Window = union(Protocol) {
         return switch (self) {
             inline else => |v| v.clientSideDecorationEnabled(),
         };
+    }
+
+    pub fn addSubprocessEnv(self: *Window, env: *std.process.EnvMap) !void {
+        switch (self.*) {
+            inline else => |*v| try v.addSubprocessEnv(env),
+        }
+    }
+
+    pub fn setUrgent(self: *Window, urgent: bool) !void {
+        switch (self.*) {
+            inline else => |*v| try v.setUrgent(urgent),
+        }
     }
 };

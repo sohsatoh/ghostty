@@ -21,7 +21,11 @@ enum QuickTerminalSpaceBehavior {
     var collectionBehavior: NSWindow.CollectionBehavior {
         let commonBehavior: [NSWindow.CollectionBehavior] = [
             .ignoresCycle,
-            .fullScreenAuxiliary
+            .fullScreenAuxiliary,
+            // Allow window to appear over other app's windows
+            .canJoinAllApplications,
+            // Prevent from appearing in Mission Control/Spaces
+            .transient
         ]
 
         switch (self) {
