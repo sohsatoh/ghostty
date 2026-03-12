@@ -98,7 +98,7 @@ pub const Shaper = struct {
             self.unichars.deinit(alloc);
         }
 
-        fn reset(self: *RunState) !void {
+        fn reset(self: *RunState) void {
             self.codepoints.clearRetainingCapacity();
             self.unichars.clearRetainingCapacity();
         }
@@ -644,8 +644,8 @@ pub const Shaper = struct {
     pub const RunIteratorHook = struct {
         shaper: *Shaper,
 
-        pub fn prepare(self: *RunIteratorHook) !void {
-            try self.shaper.run_state.reset();
+        pub fn prepare(self: *RunIteratorHook) void {
+            self.shaper.run_state.reset();
             // log.warn("----------- run reset -------------", .{});
         }
 
@@ -681,7 +681,7 @@ pub const Shaper = struct {
             });
         }
 
-        pub fn finalize(self: RunIteratorHook) !void {
+        pub fn finalize(self: RunIteratorHook) void {
             _ = self;
         }
     };
@@ -1895,7 +1895,7 @@ test "shape Bengali ligatures with out of order vowels" {
         try testing.expectEqual(@as(u16, 0), cells[0].x);
         try testing.expectEqual(@as(u16, 0), cells[1].x);
         // See the giant "We need to reset the `cell_offset`" comment, but here
-        // we should technically have the rest of these be `x` of 1, but that
+        // we should technically have the rest of these be `x` of 2, but that
         // would require going back in the stream to adjust past cells, and
         // we don't take on that complexity.
         try testing.expectEqual(@as(u16, 0), cells[2].x);

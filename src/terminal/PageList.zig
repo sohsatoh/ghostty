@@ -9,8 +9,10 @@ const build_options = @import("terminal_options");
 const Allocator = std.mem.Allocator;
 const assert = @import("../quirks.zig").inlineAssert;
 const fastmem = @import("../fastmem.zig");
+const tripwire = @import("../tripwire.zig");
 const DoublyLinkedList = @import("../datastruct/main.zig").IntrusiveDoublyLinkedList;
 const color = @import("color.zig");
+const highlight = @import("highlight.zig");
 const kitty = @import("kitty.zig");
 const point = @import("point.zig");
 const pagepkg = @import("page.zig");
@@ -84,7 +86,7 @@ pub const MemoryPool = struct {
         gen_alloc: Allocator,
         page_alloc: Allocator,
         preheat: usize,
-    ) !MemoryPool {
+    ) Allocator.Error!MemoryPool {
         var node_pool = try NodePool.initPreheated(gen_alloc, preheat);
         errdefer node_pool.deinit();
         var page_pool = try PagePool.initPreheated(page_alloc, preheat);
@@ -330,6 +332,13 @@ inline fn pageAllocator() Allocator {
     return mach.taggedPageAllocator(.application_specific_1);
 }
 
+const init_tw = tripwire.module(enum {
+    init_memory_pool,
+    init_pages,
+    viewport_pin,
+    viewport_pin_track,
+}, init);
+
 /// Initialize the page. The top of the first page in the list is always the
 /// top of the active area of the screen (important knowledge for quickly
 /// setting up cursors in Screen).
@@ -351,16 +360,21 @@ pub fn init(
     cols: size.CellCountInt,
     rows: size.CellCountInt,
     max_size: ?usize,
-) !PageList {
+) Allocator.Error!PageList {
+    const tw = init_tw;
+
     // The screen starts with a single page that is the entire viewport,
     // and we'll split it thereafter if it gets too large and add more as
     // necessary.
+    try tw.check(.init_memory_pool);
     var pool = try MemoryPool.init(
         alloc,
         pageAllocator(),
         page_preheat,
     );
     errdefer pool.deinit();
+
+    try tw.check(.init_pages);
     var page_serial: u64 = 0;
     const page_list, const page_size = try initPages(
         &pool,
@@ -373,12 +387,16 @@ pub fn init(
     const min_max_size = minMaxSize(cols, rows);
 
     // We always track our viewport pin to ensure this is never an allocation
+    try tw.check(.viewport_pin);
     const viewport_pin = try pool.pins.create();
     viewport_pin.* = .{ .node = page_list.first.? };
     var tracked_pins: PinSet = .{};
     errdefer tracked_pins.deinit(pool.alloc);
+
+    try tw.check(.viewport_pin_track);
     try tracked_pins.putNoClobber(pool.alloc, viewport_pin, {});
 
+    errdefer comptime unreachable;
     const result: PageList = .{
         .cols = cols,
         .rows = rows,
@@ -399,12 +417,20 @@ pub fn init(
     return result;
 }
 
+const initPages_tw = tripwire.module(enum {
+    page_node,
+    page_buf_std,
+    page_buf_non_std,
+}, initPages);
+
 fn initPages(
     pool: *MemoryPool,
     serial: *u64,
     cols: size.CellCountInt,
     rows: size.CellCountInt,
 ) Allocator.Error!struct { List, usize } {
+    const tw = initPages_tw;
+
     var page_list: List = .{};
     var page_size: usize = 0;
 
@@ -418,17 +444,34 @@ fn initPages(
     // redundant here for safety.
     assert(layout.total_size <= size.max_page_size);
 
+    // If we have an error, we need to clean up our non-standard pages
+    // since they're not in the pool.
+    errdefer {
+        var it = page_list.first;
+        while (it) |node| : (it = node.next) {
+            if (node.data.memory.len > std_size) {
+                page_alloc.free(node.data.memory);
+            }
+        }
+    }
+
     var rem = rows;
     while (rem > 0) {
+        try tw.check(.page_node);
         const node = try pool.nodes.create();
-        const page_buf = if (pooled)
-            try pool.pages.create()
-        else
-            try page_alloc.alignedAlloc(
+        errdefer pool.nodes.destroy(node);
+
+        const page_buf = if (pooled) buf: {
+            try tw.check(.page_buf_std);
+            break :buf try pool.pages.create();
+        } else buf: {
+            try tw.check(.page_buf_non_std);
+            break :buf try page_alloc.alignedAlloc(
                 u8,
                 .fromByteUnits(std.heap.page_size_min),
                 layout.total_size,
             );
+        };
         errdefer if (pooled)
             pool.pages.destroy(page_buf)
         else
@@ -451,6 +494,7 @@ fn initPages(
         // Add the page to the list
         page_list.append(node);
         page_size += page_buf.len;
+        errdefer comptime unreachable;
 
         // Increment our serial
         serial.* += 1;
@@ -485,10 +529,11 @@ pub inline fn pauseIntegrityChecks(self: *PageList, pause: bool) void {
 }
 
 const IntegrityError = error{
+    PageSerialInvalid,
     TotalRowsMismatch,
+    TrackedPinInvalid,
     ViewportPinOffsetMismatch,
     ViewportPinInsufficientRows,
-    PageSerialInvalid,
 };
 
 /// Verify the integrity of the PageList. This is expensive and should
@@ -527,6 +572,11 @@ fn verifyIntegrity(self: *const PageList) IntegrityError!void {
             .{ self.total_rows, actual_total },
         );
         return IntegrityError.TotalRowsMismatch;
+    }
+
+    // Verify that all our tracked pins point to valid pages.
+    for (self.tracked_pins.keys()) |p| {
+        if (!self.pinIsValid(p.*)) return error.TrackedPinInvalid;
     }
 
     if (self.viewport == .pin) {
@@ -732,7 +782,11 @@ pub fn clone(
     alloc: Allocator,
     opts: Clone,
 ) !PageList {
-    var it = self.pageIterator(.right_down, opts.top, opts.bot);
+    var it = self.pageIterator(
+        .right_down,
+        opts.top,
+        opts.bot,
+    );
 
     // First, count our pages so our preheat is exactly what we need.
     var it_copy = it;
@@ -750,8 +804,8 @@ pub fn clone(
     );
     errdefer pool.deinit();
 
-    // Our viewport pin is always undefined since our viewport in a clones
-    // goes back to the top
+    // Create our viewport. In a clone, the viewport always goes
+    // to the top.
     const viewport_pin = try pool.pins.create();
     var tracked_pins: PinSet = .{};
     errdefer tracked_pins.deinit(pool.alloc);
@@ -816,6 +870,10 @@ pub fn clone(
             }
         }
     }
+
+    // Initialize our viewport pin to point to the first cloned page
+    // so it points to valid memory.
+    viewport_pin.* = .{ .node = page_list.first.? };
 
     var result: PageList = .{
         .pool = pool,
@@ -1171,7 +1229,7 @@ const ReflowCursor = struct {
 
             // If the row has a semantic prompt then the blank row is meaningful
             // so we just consider pretend the first cell of the row isn't empty.
-            if (cols_len == 0 and src_row.semantic_prompt != .unknown) cols_len = 1;
+            if (cols_len == 0 and src_row.semantic_prompt != .none) cols_len = 1;
         }
 
         // Handle tracked pin adjustments.
@@ -1259,9 +1317,26 @@ const ReflowCursor = struct {
             )) |result| switch (result) {
                 // Wrote the cell, move to the next.
                 .success => x += 1,
+
                 // Wrote the cell but request to skip the next so skip it.
                 // This is used for things like spacers.
-                .skip_next => x += 2,
+                .skip_next => {
+                    // Remap any tracked pins at the skipped position (x+1)
+                    // since we won't process that cell in the loop.
+                    const pin_keys = list.tracked_pins.keys();
+                    for (pin_keys) |p| {
+                        if (&p.node.data != src_page or
+                            p.y != src_y or
+                            p.x != x + 1) continue;
+
+                        p.node = self.node;
+                        p.x = self.x;
+                        p.y = self.y;
+                    }
+
+                    x += 2;
+                },
+
                 // Didn't write the cell, repeat writing this same cell.
                 .repeat => {},
             } else |err| switch (err) {
@@ -1898,7 +1973,7 @@ const ReflowCursor = struct {
 
         // If the row has a semantic prompt then the blank row is meaningful
         // so we always return all but one so that the row is drawn.
-        if (self.page_row.semantic_prompt != .unknown) return len - 1;
+        if (self.page_row.semantic_prompt != .none) return len - 1;
 
         return len;
     }
@@ -2079,7 +2154,16 @@ fn resizeWithoutReflowGrowCols(
 
     // Unlikely fast path: we have capacity in the page. This
     // is only true if we resized to less cols earlier.
-    if (page.capacity.cols >= cols) {
+    if (page.capacity.cols >= cols) fast: {
+        // If any row has a spacer head at the old last column, it will
+        // be invalid at the new (wider) size. Fall through to the slow
+        // path which handles spacer heads correctly via cloneRowFrom.
+        const rows = page.rows.ptr(page.memory)[0..page.size.rows];
+        for (rows) |*row| {
+            const cells = page.getCells(row);
+            if (cells[old_cols - 1].wide == .spacer_head) break :fast;
+        }
+
         page.size.cols = cols;
         return;
     }
@@ -2167,6 +2251,14 @@ fn resizeWithoutReflowGrowCols(
 
         assert(copied == len);
         assert(prev_page.size.rows <= prev_page.capacity.rows);
+
+        // Remap any tracked pins that pointed to rows we just copied to prev.
+        const pin_keys = self.tracked_pins.keys();
+        for (pin_keys) |p| {
+            if (p.node != chunk.node or p.y >= len) continue;
+            p.node = prev_node;
+            p.y += prev_page.size.rows - len;
+        }
     }
 
     // If we have an error, we clear the rows we just added to our prev page.
@@ -2586,21 +2678,37 @@ fn scrollPrompt(self: *PageList, delta: isize) void {
     const delta_start: usize = @intCast(if (delta > 0) delta else -delta);
     var delta_rem: usize = delta_start;
 
-    // Iterate and count the number of prompts we see.
-    const viewport_pin = self.getTopLeft(.viewport);
-    var it = viewport_pin.rowIterator(if (delta > 0) .right_down else .left_up, null);
-    _ = it.next(); // skip our own row
-    var prompt_pin: ?Pin = null;
-    while (it.next()) |next| {
-        const row = next.rowAndCell().row;
-        switch (row.semantic_prompt) {
-            .command, .unknown => {},
-            .prompt, .prompt_continuation, .input => {
-                delta_rem -= 1;
-                prompt_pin = next;
-            },
+    // We start at the row before or after our viewport depending on the
+    // delta so that we don't land back on our current viewport.
+    const start_pin = start: {
+        const tl = self.getTopLeft(.viewport);
+
+        // If we're moving up we can just move the viewport up because
+        // promptIterator handles jumpting to the start of prompts.
+        if (delta <= 0) break :start tl.up(1) orelse return;
+
+        // If we're moving down and we're presently at some kind of
+        // prompt, we need to skip all the continuation lines because
+        // promptIterator can't know if we're cutoff or continuing.
+        var adjusted: Pin = tl.down(1) orelse return;
+        if (tl.rowAndCell().row.semantic_prompt != .none) skip: {
+            while (adjusted.rowAndCell().row.semantic_prompt == .prompt_continuation) {
+                adjusted = adjusted.down(1) orelse break :skip;
+            }
         }
 
+        break :start adjusted;
+    };
+
+    // Go through prompts delta times
+    var it = start_pin.promptIterator(
+        if (delta > 0) .right_down else .left_up,
+        null,
+    );
+    var prompt_pin: ?Pin = null;
+    while (it.next()) |next| {
+        prompt_pin = next;
+        delta_rem -= 1;
         if (delta_rem == 0) break;
     }
 
@@ -2620,7 +2728,7 @@ fn scrollPrompt(self: *PageList, delta: isize) void {
 
 /// Clear the screen by scrolling written contents up into the scrollback.
 /// This will not update the viewport.
-pub fn scrollClear(self: *PageList) !void {
+pub fn scrollClear(self: *PageList) Allocator.Error!void {
     defer self.assertIntegrity();
 
     // Go through the active area backwards to find the first non-empty
@@ -2648,6 +2756,166 @@ pub fn scrollClear(self: *PageList) !void {
 
     // Scroll
     for (0..non_empty) |_| _ = try self.grow();
+}
+
+/// Compact a page to use the minimum required memory for the contents
+/// it stores. Returns the new node pointer if compaction occurred, or null
+/// if the page was already compact or compaction would not provide meaningful
+/// savings.
+///
+/// The current design of PageList at the time of writing this doesn't
+/// allow for smaller than `std_size` nodes so if the current node's backing
+/// page is standard size or smaller, no compaction will occur. In the
+/// future we should fix this up.
+///
+/// If this returns OOM, the PageList is left unchanged and no dangling
+/// memory references exist. It is safe to ignore the error and continue using
+/// the uncompacted page.
+pub fn compact(self: *PageList, node: *List.Node) Allocator.Error!?*List.Node {
+    defer self.assertIntegrity();
+    const page: *Page = &node.data;
+
+    // We should never have empty rows in our pagelist anyways...
+    assert(page.size.rows > 0);
+
+    // We never compact standard size or smaller pages because changing
+    // the capacity to something smaller won't save memory.
+    if (page.memory.len <= std_size) return null;
+
+    // Compute the minimum capacity required for this page's content
+    const req_cap = page.exactRowCapacity(0, page.size.rows);
+    const new_size = Page.layout(req_cap).total_size;
+    const old_size = page.memory.len;
+    if (new_size >= old_size) return null;
+
+    // Create the new smaller page
+    const new_node = try self.createPage(req_cap);
+    errdefer self.destroyNode(new_node);
+    const new_page: *Page = &new_node.data;
+    new_page.size = page.size;
+    new_page.dirty = page.dirty;
+    new_page.cloneFrom(
+        page,
+        0,
+        page.size.rows,
+    ) catch |err| {
+        // cloneFrom should not fail when compacting since req_cap is
+        // computed to exactly fit the source content and our expectation
+        // of exactRowCapacity ensures it can fit all the requested
+        // data.
+        log.err("compact clone failed err={}", .{err});
+
+        // In this case, let's gracefully degrade by pretending we
+        // didn't need to compact.
+        self.destroyNode(new_node);
+        return null;
+    };
+
+    // Fix up all tracked pins to point to the new page
+    const pin_keys = self.tracked_pins.keys();
+    for (pin_keys) |p| {
+        if (p.node != node) continue;
+        p.node = new_node;
+    }
+
+    // Insert the new page and destroy the old one
+    self.pages.insertBefore(node, new_node);
+    self.pages.remove(node);
+    self.destroyNode(node);
+
+    new_page.assertIntegrity();
+    return new_node;
+}
+
+pub const SplitError = error{
+    // Allocator OOM
+    OutOfMemory,
+    // Page can't be split further because it is already a single row.
+    OutOfSpace,
+};
+
+/// Split the given node in the PageList at the given pin.
+///
+/// The row at the pin and after will be moved into a new page with
+/// the same capacity as the original page. Alternatively, you can "split
+/// above" by splitting the row following the desired split row.
+///
+/// Since the split happens below the pin, the pin remains valid.
+pub fn split(
+    self: *PageList,
+    p: Pin,
+) SplitError!void {
+    if (build_options.slow_runtime_safety) assert(self.pinIsValid(p));
+
+    // Ran into a bug that I can only explain via aliasing. If a tracked
+    // pin is passed in, its possible Zig will alias the memory and then
+    // when we modify it later it updates our p here. Copying the node
+    // fixes this.
+    const original_node = p.node;
+    const page: *Page = &original_node.data;
+
+    // A page that is already 1 row can't be split. In the future we can
+    // theoretically maybe split by soft-wrapping multiple pages but that
+    // seems crazy and the rest of our PageList can't handle heterogeneously
+    // sized pages today.
+    if (page.size.rows <= 1) return error.OutOfSpace;
+
+    // Splitting at row 0 is a no-op since there's nothing before the split point.
+    if (p.y == 0) return;
+
+    // At this point we're doing actual modification so make sure
+    // on the return that we're good.
+    defer self.assertIntegrity();
+
+    // Create a new node with the same capacity of managed memory.
+    const target = try self.createPage(page.capacity);
+    errdefer self.destroyNode(target);
+
+    // Determine how many rows we're copying
+    const y_start = p.y;
+    const y_end = page.size.rows;
+    target.data.size.rows = y_end - y_start;
+    assert(target.data.size.rows <= target.data.capacity.rows);
+
+    // Copy our old data. This should NOT fail because we have the
+    // capacity of the old page which already fits the data we requested.
+    target.data.cloneFrom(page, y_start, y_end) catch |err| {
+        log.err(
+            "error cloning rows for split err={}",
+            .{err},
+        );
+
+        // Rather than crash, we return an OutOfSpace to show that
+        // we couldn't split and let our callers gracefully handle it.
+        // Realistically though... this should not happen.
+        return error.OutOfSpace;
+    };
+
+    // From this point forward there is no going back. We have no
+    // error handling. It is possible but we haven't written it.
+    errdefer comptime unreachable;
+
+    // Move any tracked pins from the copied rows
+    for (self.tracked_pins.keys()) |tracked| {
+        if (&tracked.node.data != page or
+            tracked.y < p.y) continue;
+
+        tracked.node = target;
+        tracked.y -= p.y;
+        // p.x remains the same since we're copying the row as-is
+    }
+
+    // Clear our rows
+    for (page.rows.ptr(page.memory)[y_start..y_end]) |*row| {
+        page.clearCells(
+            row,
+            0,
+            page.size.cols,
+        );
+    }
+    page.size.rows -= y_end - y_start;
+
+    self.pages.insertAfter(original_node, target);
 }
 
 /// This represents the state necessary to render a scrollbar for this
@@ -3044,6 +3312,9 @@ pub fn increaseCapacity(
         log.err("increaseCapacity clone failed err={}", .{err});
         @panic("unexpected clone failure");
     };
+
+    // Preserve page-level dirty flag (cloneFrom only copies row data)
+    new_page.dirty = page.dirty;
 
     // Must not fail after this because the operations we do after this
     // can't be recovered.
@@ -3644,6 +3915,12 @@ pub fn countTrackedPins(self: *const PageList) usize {
     return self.tracked_pins.count();
 }
 
+/// Returns the tracked pins for this pagelist. The slice is owned by the
+/// pagelist and is only valid until the pagelist is modified.
+pub fn trackedPins(self: *const PageList) []const *Pin {
+    return self.tracked_pins.keys();
+}
+
 /// Checks if a pin is valid for this pagelist. This is a very slow and
 /// expensive operation since we traverse the entire linked list in the
 /// worst case. Only for runtime safety/debug.
@@ -3769,7 +4046,10 @@ pub fn getCell(self: *const PageList, pt: point.Point) ?Cell {
 ///    1 | etc.| | 4
 ///      +-----+ :
 ///     +--------+
-pub fn diagram(self: *const PageList, writer: *std.Io.Writer) !void {
+pub fn diagram(
+    self: *const PageList,
+    writer: *std.Io.Writer,
+) std.Io.Writer.Error!void {
     const active_pin = self.getTopLeft(.active);
 
     var active = false;
@@ -3956,8 +4236,320 @@ pub fn diagram(self: *const PageList, writer: *std.Io.Writer) !void {
     }
 }
 
+/// Returns the boundaries of the given semantic content type for
+/// the prompt at the given pin. The pin row MUST be the first row
+/// of a prompt, otherwise the results may be nonsense.
+///
+/// To get prompt pins, use promptIterator. Warning that if there are
+/// no semantic prompts ever present, promptIterator will iterate the
+/// entire PageList. Downstream callers should keep track of a flag if
+/// they've ever seen semantic prompt operations to prevent this performance
+/// case.
+///
+/// Note that some semantic content type such as "input" is usually
+/// nested within prompt boundaries, so the returned boundaries may include
+/// prompt text.
+pub fn highlightSemanticContent(
+    self: *const PageList,
+    at: Pin,
+    content: pagepkg.Cell.SemanticContent,
+) ?highlight.Untracked {
+    // Performance note: we can do this more efficiently in a single
+    // forward-pass. Semantic content operations aren't usually fast path
+    // but if someone wants to optimize them someday that's great.
+
+    const end: Pin = end: {
+        // Safety assertion, our starting point should be a prompt row.
+        // so the first returned prompt should be ourselves.
+        var it = at.promptIterator(.right_down, null);
+        assert(it.next().?.y == at.y);
+
+        // Our end is the end of the line just before the next prompt
+        // line, which should exist since we verified we have at least
+        // two prompts here.
+        if (it.next()) |next| next: {
+            var prev = next.up(1) orelse break :next;
+            prev.x = prev.node.data.size.cols - 1;
+            break :end prev;
+        }
+
+        // Didn't find any further prompt so the end of our zone is
+        // the end of the screen.
+        break :end self.getBottomRight(.screen).?;
+    };
+
+    switch (content) {
+        // For the prompt, we select all the way up to command output.
+        // We include all the input lines, too.
+        .prompt => {
+            var result: highlight.Untracked = .{
+                .start = at.left(at.x),
+                .end = at,
+            };
+
+            var it = at.cellIterator(.right_down, end);
+            while (it.next()) |p| {
+                switch (p.rowAndCell().cell.semantic_content) {
+                    .prompt, .input => result.end = p,
+                    .output => break,
+                }
+            }
+
+            return result;
+        },
+
+        // For input, we include the start of the input to the end of
+        // the input, which may include all the prompts in the middle, too.
+        .input => {
+            var result: highlight.Untracked = .{
+                .start = undefined,
+                .end = undefined,
+            };
+
+            // Find the start
+            var it = at.cellIterator(.right_down, end);
+            while (it.next()) |p| {
+                switch (p.rowAndCell().cell.semantic_content) {
+                    .prompt => {},
+                    .input => {
+                        result.start = p;
+                        result.end = p;
+                        break;
+                    },
+                    .output => return null,
+                }
+            } else {
+                // No input found
+                return null;
+            }
+
+            // Find the end
+            while (it.next()) |p| {
+                switch (p.rowAndCell().cell.semantic_content) {
+                    // Prompts can be nested in our input for continuation
+                    .prompt => {},
+
+                    // Output means we're done
+                    .output => break,
+
+                    .input => result.end = p,
+                }
+            }
+
+            return result;
+        },
+
+        .output => {
+            var result: highlight.Untracked = .{
+                .start = undefined,
+                .end = undefined,
+            };
+
+            // Find the start
+            var it = at.cellIterator(.right_down, end);
+            while (it.next()) |p| {
+                const cell = p.rowAndCell().cell;
+                switch (cell.semantic_content) {
+                    .prompt, .input => {},
+                    .output => {
+                        // Skip empty cells - they default to .output but aren't real output
+                        if (!cell.hasText()) continue;
+                        result.start = p;
+                        result.end = p;
+                        break;
+                    },
+                }
+            } else {
+                // No output found
+                return null;
+            }
+
+            // Find the end
+            while (it.next()) |p| {
+                const cell = p.rowAndCell().cell;
+                switch (cell.semantic_content) {
+                    .prompt, .input => break,
+                    .output => {
+                        // Only extend to cells with actual text
+                        if (cell.hasText()) result.end = p;
+                    },
+                }
+            }
+
+            return result;
+        },
+    }
+}
+
 /// Direction that iterators can move.
 pub const Direction = enum { left_up, right_down };
+
+pub const PromptIterator = struct {
+    /// The pin that we are currently at. Also the starting pin when
+    /// initializing.
+    current: ?Pin,
+
+    /// The pin to end at or null if we end when we can't traverse
+    /// anymore.
+    limit: ?Pin,
+
+    /// The direction to do the traversal.
+    direction: Direction,
+
+    pub const empty: PromptIterator = .{
+        .current = null,
+        .limit = null,
+        .direction = .left_up,
+    };
+
+    /// Return the next pin that represents the first row in a prompt.
+    /// From here, you can find the prompt input, command output, etc.
+    pub fn next(self: *PromptIterator) ?Pin {
+        switch (self.direction) {
+            .left_up => return self.nextLeftUp(),
+            .right_down => return self.nextRightDown(),
+        }
+    }
+
+    pub fn nextRightDown(self: *PromptIterator) ?Pin {
+        // Start at our current pin. If we have no current it means
+        // we reached the end and we're done.
+        const start: Pin = self.current orelse return null;
+
+        // We need to traverse downwards and look for prompts.
+        var current: ?Pin = start;
+        while (current) |p| : (current = p.down(1)) {
+            // Check our limit.
+            const at_limit = if (self.limit) |limit| limit.eql(p) else false;
+
+            const rac = p.rowAndCell();
+            switch (rac.row.semantic_prompt) {
+                // This row isn't a prompt. Keep looking.
+                .none => if (at_limit) break,
+
+                // This is a prompt line or continuation line. In either
+                // case we consider the first line the prompt, and then
+                // skip over any remaining prompt lines. This handles the
+                // case where scrollback pruned the prompt.
+                .prompt, .prompt_continuation => {
+                    // If we're at our limit just return this prompt.
+                    if (at_limit) {
+                        self.current = null;
+                        return p.left(p.x);
+                    }
+
+                    // Skip over any continuation lines that follow this prompt,
+                    // up to our limit.
+                    var end_pin = p;
+                    while (end_pin.down(1)) |next_pin| : (end_pin = next_pin) {
+                        switch (next_pin.rowAndCell().row.semantic_prompt) {
+                            .prompt_continuation => if (self.limit) |limit| {
+                                if (limit.eql(next_pin)) break;
+                            },
+
+                            .prompt, .none => {
+                                self.current = next_pin;
+                                return p.left(p.x);
+                            },
+                        }
+                    }
+
+                    self.current = null;
+                    return p.left(p.x);
+                },
+            }
+        }
+
+        self.current = null;
+        return null;
+    }
+
+    pub fn nextLeftUp(self: *PromptIterator) ?Pin {
+        // Start at our current pin. If we have no current it means
+        // we reached the end and we're done.
+        const start: Pin = self.current orelse return null;
+
+        // We need to traverse upwards and look for prompts.
+        var current: ?Pin = start;
+        while (current) |p| : (current = p.up(1)) {
+            // Check our limit.
+            const at_limit = if (self.limit) |limit| limit.eql(p) else false;
+
+            const rac = p.rowAndCell();
+            switch (rac.row.semantic_prompt) {
+                // This row isn't a prompt. Keep looking.
+                .none => if (at_limit) break,
+
+                // This is a prompt line.
+                .prompt => {
+                    self.current = if (at_limit) null else p.up(1);
+                    return p.left(p.x);
+                },
+
+                // If this is a prompt continuation, then we continue
+                // looking for the start of the prompt OR a non-prompt
+                // line, whichever is first. The non-prompt line is to handle
+                // poorly behaved programs or scrollback that's been cut-off.
+                .prompt_continuation => {
+                    // If we're at our limit just return this continuation as prompt.
+                    if (at_limit) {
+                        self.current = null;
+                        return p.left(p.x);
+                    }
+
+                    var end_pin = p;
+                    while (end_pin.up(1)) |prior| : (end_pin = prior) {
+                        if (self.limit) |limit| {
+                            if (limit.eql(prior)) break;
+                        }
+
+                        switch (prior.rowAndCell().row.semantic_prompt) {
+                            // No prompt. That means our last pin is good!
+                            .none => {
+                                self.current = prior;
+                                return end_pin.left(end_pin.x);
+                            },
+
+                            // Prompt continuation, keep looking.
+                            .prompt_continuation => {},
+
+                            // Prompt! Found it!
+                            .prompt => {
+                                self.current = prior.up(1);
+                                return prior.left(prior.x);
+                            },
+                        }
+                    }
+
+                    // No prior rows, trimmed scrollback probably.
+                    self.current = null;
+                    return p.left(p.x);
+                },
+            }
+        }
+
+        self.current = null;
+        return null;
+    }
+};
+
+pub fn promptIterator(
+    self: *const PageList,
+    direction: Direction,
+    tl_pt: point.Point,
+    bl_pt: ?point.Point,
+) PromptIterator {
+    const tl_pin = self.pin(tl_pt).?;
+    const bl_pin = if (bl_pt) |pt|
+        self.pin(pt).?
+    else
+        self.getBottomRight(tl_pt) orelse return .empty;
+
+    return switch (direction) {
+        .right_down => tl_pin.promptIterator(.right_down, bl_pin),
+        .left_up => bl_pin.promptIterator(.left_up, tl_pin),
+    };
+}
 
 pub const CellIterator = struct {
     row_it: RowIterator,
@@ -4406,7 +4998,7 @@ pub fn totalPages(self: *const PageList) usize {
 
 /// Grow the number of rows available in the page list by n.
 /// This is only used for testing so it isn't optimized in any way.
-fn growRows(self: *PageList, n: usize) !void {
+fn growRows(self: *PageList, n: usize) Allocator.Error!void {
     for (0..n) |_| _ = try self.grow();
 }
 
@@ -4560,6 +5152,18 @@ pub const Pin = struct {
         var cell = row_it.next() orelse return .{ .row_it = row_it };
         cell.x = self.x;
         return .{ .row_it = row_it, .cell = cell };
+    }
+
+    pub inline fn promptIterator(
+        self: Pin,
+        direction: Direction,
+        limit: ?Pin,
+    ) PromptIterator {
+        return .{
+            .current = self,
+            .limit = limit,
+            .direction = direction,
+        };
     }
 
     /// Returns true if this pin is between the top and bottom, inclusive.
@@ -4837,7 +5441,7 @@ pub const Pin = struct {
     }
 };
 
-const Cell = struct {
+pub const Cell = struct {
     node: *List.Node,
     row: *pagepkg.Row,
     cell: *pagepkg.Cell,
@@ -4914,6 +5518,62 @@ test "PageList" {
         .offset = 0,
         .len = s.rows,
     }, s.scrollbar());
+}
+
+test "PageList init error" {
+    // Test every failure point in `init` and ensure that we don't
+    // leak memory (testing.allocator verifies) since we're exiting early.
+    for (std.meta.tags(init_tw.FailPoint)) |tag| {
+        const tw = init_tw;
+        defer tw.end(.reset) catch unreachable;
+        tw.errorAlways(tag, error.OutOfMemory);
+        try std.testing.expectError(
+            error.OutOfMemory,
+            init(
+                std.testing.allocator,
+                80,
+                24,
+                null,
+            ),
+        );
+    }
+
+    // init calls initPages transitively, so let's check that if
+    // any failures happen in initPages, we also don't leak memory.
+    for (std.meta.tags(initPages_tw.FailPoint)) |tag| {
+        const tw = initPages_tw;
+        defer tw.end(.reset) catch unreachable;
+        tw.errorAlways(tag, error.OutOfMemory);
+
+        const cols: size.CellCountInt = if (tag == .page_buf_std) 80 else std_capacity.maxCols().? + 1;
+        try std.testing.expectError(
+            error.OutOfMemory,
+            init(
+                std.testing.allocator,
+                cols,
+                24,
+                null,
+            ),
+        );
+    }
+
+    // Try non-standard pages since they don't go in our pool.
+    for ([_]initPages_tw.FailPoint{
+        .page_buf_non_std,
+    }) |tag| {
+        const tw = initPages_tw;
+        defer tw.end(.reset) catch unreachable;
+        tw.errorAfter(tag, error.OutOfMemory, 1);
+        try std.testing.expectError(
+            error.OutOfMemory,
+            init(
+                std.testing.allocator,
+                std_capacity.maxCols().? + 1,
+                std_capacity.rows + 1,
+                null,
+            ),
+        );
+    }
 }
 
 test "PageList init rows across two pages" {
@@ -6217,6 +6877,55 @@ test "Screen: jump back one prompt" {
     }
 }
 
+test "Screen: jump forward prompt skips multiline continuation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 5, 3, null);
+    defer s.deinit();
+    try s.growRows(7);
+
+    // Multiline prompt on rows 1-3.
+    {
+        const p = s.pin(.{ .screen = .{ .y = 1 } }).?;
+        p.rowAndCell().row.semantic_prompt = .prompt;
+    }
+    {
+        const p = s.pin(.{ .screen = .{ .y = 2 } }).?;
+        p.rowAndCell().row.semantic_prompt = .prompt_continuation;
+    }
+    {
+        const p = s.pin(.{ .screen = .{ .y = 3 } }).?;
+        p.rowAndCell().row.semantic_prompt = .prompt_continuation;
+    }
+
+    // Next prompt after command output.
+    {
+        const p = s.pin(.{ .screen = .{ .y = 6 } }).?;
+        p.rowAndCell().row.semantic_prompt = .prompt;
+    }
+
+    // Starting at the first prompt line should jump to the next prompt,
+    // not to continuation lines.
+    s.scroll(.{ .row = 1 });
+    s.scroll(.{ .delta_prompt = 1 });
+    try testing.expect(s.viewport == .pin);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 6,
+    } }, s.pointFromPin(.screen, s.pin(.{ .viewport = .{} }).?).?);
+
+    // Starting in the middle of continuation lines should also jump to
+    // the next prompt.
+    s.scroll(.{ .row = 2 });
+    s.scroll(.{ .delta_prompt = 1 });
+    try testing.expect(s.viewport == .pin);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 6,
+    } }, s.pointFromPin(.screen, s.pin(.{ .viewport = .{} }).?).?);
+}
+
 test "PageList grow fit in capacity" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -6942,6 +7651,37 @@ test "PageList increaseCapacity multi-page" {
     );
 }
 
+test "PageList increaseCapacity preserves dirty flag" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 2, 4, 0);
+    defer s.deinit();
+
+    // Set page dirty flag and mark some rows as dirty
+    const page = &s.pages.first.?.data;
+    page.dirty = true;
+
+    const rows = page.rows.ptr(page.memory);
+    rows[0].dirty = true;
+    rows[1].dirty = false;
+    rows[2].dirty = true;
+    rows[3].dirty = false;
+
+    // Increase capacity
+    const new_node = try s.increaseCapacity(s.pages.first.?, .styles);
+
+    // The page dirty flag should be preserved
+    try testing.expect(new_node.data.dirty);
+
+    // Row dirty flags should be preserved
+    const new_rows = new_node.data.rows.ptr(new_node.data.memory);
+    try testing.expect(new_rows[0].dirty);
+    try testing.expect(!new_rows[1].dirty);
+    try testing.expect(new_rows[2].dirty);
+    try testing.expect(!new_rows[3].dirty);
+}
+
 test "PageList pageIterator single page" {
     const testing = std.testing;
     const alloc = testing.allocator;
@@ -7222,6 +7962,1330 @@ test "PageList cellIterator reverse" {
         } }, s.pointFromPin(.screen, p).?);
     }
     try testing.expect(it.next() == null);
+}
+
+test "PageList promptIterator left_up" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 2, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+    // Normal prompt
+    {
+        const rac = page.getRowAndCell(0, 3);
+        rac.row.semantic_prompt = .prompt;
+    }
+    // Continuation
+    {
+        const rac = page.getRowAndCell(0, 6);
+        rac.row.semantic_prompt = .prompt;
+    }
+    {
+        const rac = page.getRowAndCell(0, 7);
+        rac.row.semantic_prompt = .prompt_continuation;
+    }
+    {
+        const rac = page.getRowAndCell(0, 8);
+        rac.row.semantic_prompt = .prompt_continuation;
+    }
+    // Broken continuation that has non-prompts in between
+    {
+        const rac = page.getRowAndCell(0, 12);
+        rac.row.semantic_prompt = .prompt_continuation;
+    }
+
+    var it = s.promptIterator(.left_up, .{ .screen = .{} }, null);
+    {
+        const p = it.next().?;
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 12,
+        } }, s.pointFromPin(.screen, p).?);
+    }
+    {
+        const p = it.next().?;
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 6,
+        } }, s.pointFromPin(.screen, p).?);
+    }
+    {
+        const p = it.next().?;
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 3,
+        } }, s.pointFromPin(.screen, p).?);
+    }
+    try testing.expect(it.next() == null);
+}
+
+test "PageList promptIterator right_down" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 2, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+    // Normal prompt
+    {
+        const rac = page.getRowAndCell(0, 3);
+        rac.row.semantic_prompt = .prompt;
+    }
+    // Continuation (prompt on row 6, continuation on rows 7-8)
+    {
+        const rac = page.getRowAndCell(0, 6);
+        rac.row.semantic_prompt = .prompt;
+    }
+    {
+        const rac = page.getRowAndCell(0, 7);
+        rac.row.semantic_prompt = .prompt_continuation;
+    }
+    {
+        const rac = page.getRowAndCell(0, 8);
+        rac.row.semantic_prompt = .prompt_continuation;
+    }
+    // Broken continuation that has non-prompts in between (orphaned continuation at row 12)
+    {
+        const rac = page.getRowAndCell(0, 12);
+        rac.row.semantic_prompt = .prompt_continuation;
+    }
+
+    var it = s.promptIterator(.right_down, .{ .screen = .{} }, null);
+    {
+        const p = it.next().?;
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 3,
+        } }, s.pointFromPin(.screen, p).?);
+    }
+    {
+        const p = it.next().?;
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 6,
+        } }, s.pointFromPin(.screen, p).?);
+    }
+    {
+        const p = it.next().?;
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 12,
+        } }, s.pointFromPin(.screen, p).?);
+    }
+    try testing.expect(it.next() == null);
+}
+
+test "PageList promptIterator right_down continuation at start" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 2, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt continuation at row 0 (no prior rows - simulates trimmed scrollback)
+    {
+        const rac = page.getRowAndCell(0, 0);
+        rac.row.semantic_prompt = .prompt_continuation;
+    }
+    {
+        const rac = page.getRowAndCell(0, 1);
+        rac.row.semantic_prompt = .prompt_continuation;
+    }
+    // Normal prompt later
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    var it = s.promptIterator(.right_down, .{ .screen = .{} }, null);
+    {
+        // Should return the first continuation line since there's no prior prompt
+        const p = it.next().?;
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 0,
+        } }, s.pointFromPin(.screen, p).?);
+    }
+    {
+        const p = it.next().?;
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 5,
+        } }, s.pointFromPin(.screen, p).?);
+    }
+    try testing.expect(it.next() == null);
+}
+
+test "PageList promptIterator right_down with prompt before continuation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 2, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 2, continuation on rows 3-4
+    // Starting iteration from row 3 should still find the prompt at row 2
+    {
+        const rac = page.getRowAndCell(0, 2);
+        rac.row.semantic_prompt = .prompt;
+    }
+    {
+        const rac = page.getRowAndCell(0, 3);
+        rac.row.semantic_prompt = .prompt_continuation;
+    }
+    {
+        const rac = page.getRowAndCell(0, 4);
+        rac.row.semantic_prompt = .prompt_continuation;
+    }
+
+    // Start iteration from row 3 (middle of the continuation)
+    // Since we start on a continuation line, we treat it as the prompt start
+    // (handles case where scrollback pruned the actual prompt)
+    var it = s.promptIterator(.right_down, .{ .screen = .{ .y = 3 } }, null);
+    {
+        const p = it.next().?;
+        // Returns row 3 since that's the first prompt-related line we encounter
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 3,
+        } }, s.pointFromPin(.screen, p).?);
+    }
+    try testing.expect(it.next() == null);
+}
+
+test "PageList promptIterator right_down limit inclusive" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 2, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Iterate with limit at row 5 (the prompt row) - should include it
+    var it = s.promptIterator(.right_down, .{ .screen = .{} }, .{ .screen = .{ .y = 5 } });
+    {
+        const p = it.next().?;
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 5,
+        } }, s.pointFromPin(.screen, p).?);
+    }
+    try testing.expect(it.next() == null);
+}
+
+test "PageList promptIterator left_up limit inclusive" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 2, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Iterate with limit at row 10 (the prompt row) - should include it
+    // tl_pt is the limit (upper bound), bl_pt is the start point for left_up
+    var it = s.promptIterator(.left_up, .{ .screen = .{ .y = 10 } }, .{ .screen = .{ .y = 15 } });
+    {
+        const p = it.next().?;
+        try testing.expectEqual(point.Point{ .screen = .{
+            .x = 0,
+            .y = 10,
+        } }, s.pointFromPin(.screen, p).?);
+    }
+    try testing.expect(it.next() == null);
+}
+
+test "PageList highlightSemanticContent prompt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        // Start the prompt for the first 5 cols
+        for (0..5) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'A' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 3 let's make input
+        for (5..8) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'B' },
+                .semantic_content = .input,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 2, .y = 5 } }).?,
+        .prompt,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 7,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent prompt with output" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        // First 3 cols are prompt
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 4 are input
+        for (3..7) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'l' },
+                .semantic_content = .input,
+            };
+        }
+
+        // Rest is output (shouldn't be included in prompt highlight)
+        for (7..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Highlighting from prompt should include prompt and input, but stop at output
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .prompt,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 6,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent prompt multiline" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt starts on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        // First row is all prompt
+        for (0..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+    }
+    // Row 6 continues with input
+    {
+        for (0..5) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Highlighting should span both rows
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 2, .y = 5 } }).?,
+        .prompt,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 6,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent prompt only" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5 with only prompt content (no input)
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        for (0..5) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Highlighting should only include the prompt cells
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .prompt,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent prompt to end of screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Single prompt on row 15, no following prompt
+    {
+        const rac = page.getRowAndCell(0, 15);
+        rac.row.semantic_prompt = .prompt;
+
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        for (3..8) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+    }
+
+    // Highlighting should include prompt and input up to column 7
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 15 } }).?,
+        .prompt,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 15,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 7,
+        .y = 15,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent input basic" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        // First 3 cols are prompt
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 5 are input
+        for (3..8) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'l' },
+                .semantic_content = .input,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Highlighting input should only include input cells
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .input,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 3,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 7,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent input with output" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        // First 2 cols are prompt
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 3 are input
+        for (2..5) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+
+        // Rest is output
+        for (5..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Highlighting input should stop at output
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .input,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 2,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent input multiline with continuation" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        // First 2 cols are prompt
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Rest is input
+        for (2..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+    }
+    // Row 6 has continuation prompt then more input
+    {
+        // Continuation prompt
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '>' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // More input
+        for (2..6) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'd' },
+                .semantic_content = .input,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Highlighting input should span both rows, skipping continuation prompts
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .input,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 2,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 5,
+        .y = 6,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent input no input returns null" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5 with only prompt, then immediately output
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        // First 3 cols are prompt
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Rest is output (no input!)
+        for (3..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Highlighting input should return null when there's no input
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .input,
+    );
+    try testing.expect(hl == null);
+}
+
+test "PageList highlightSemanticContent input to end of screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Single prompt on row 15, no following prompt
+    {
+        const rac = page.getRowAndCell(0, 15);
+        rac.row.semantic_prompt = .prompt;
+
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        for (2..7) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+    }
+
+    // Highlighting input with no following prompt
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 15 } }).?,
+        .input,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 2,
+        .y = 15,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 6,
+        .y = 15,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent input prompt only returns null" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5 with only prompt content, no input or output
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        // All cells are prompt
+        for (0..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+    }
+    // Mark rows 6-9 as prompt to ensure no input before next prompt
+    {
+        for (6..10) |y| {
+            for (0..10) |x| {
+                const cell = page.getRowAndCell(x, y).cell;
+                cell.semantic_content = .prompt;
+            }
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Highlighting input should return null when there's only prompts
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .input,
+    );
+    try testing.expect(hl == null);
+}
+
+test "PageList highlightSemanticContent output basic" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        // First 2 cols are prompt
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 3 are input
+        for (2..5) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'l' },
+                .semantic_content = .input,
+            };
+        }
+
+        // Cols 5-7 are output
+        for (5..8) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+
+        // Mark remaining cells as prompt to bound the output
+        for (8..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.semantic_content = .prompt;
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Highlighting output should only include output cells
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .output,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 5,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 7,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent output multiline" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        // First 2 cols are prompt
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 2 are input
+        for (2..4) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'l' },
+                .semantic_content = .input,
+            };
+        }
+
+        // Rest of row 5 is output
+        for (4..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Row 6 is all output
+    {
+        for (0..10) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Row 7 has partial output then input to bound it
+    {
+        for (0..5) |x| {
+            const cell = page.getRowAndCell(x, 7).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+        for (5..10) |x| {
+            const cell = page.getRowAndCell(x, 7).cell;
+            cell.semantic_content = .input;
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Highlighting output should span multiple rows
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .output,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 7,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent output stops at next prompt" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        // First 2 cols are prompt
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Next 2 are input
+        for (2..4) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'l' },
+                .semantic_content = .input,
+            };
+        }
+
+        // Rest is output
+        for (4..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Row 6 has output then prompt starts
+    {
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+        // Next prompt marker on same row
+        for (3..6) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+    }
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Highlighting output should stop before prompt/input
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .output,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 5,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 2,
+        .y = 6,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent output to end of screen" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Single prompt on row 15, no following prompt
+    {
+        const rac = page.getRowAndCell(0, 15);
+        rac.row.semantic_prompt = .prompt;
+
+        for (0..2) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        for (2..4) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+
+        for (4..10) |x| {
+            const cell = page.getRowAndCell(x, 15).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+    }
+    // Row 16 has output then prompt to bound it
+    {
+        for (0..8) |x| {
+            const cell = page.getRowAndCell(x, 16).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'o' },
+                .semantic_content = .output,
+            };
+        }
+        for (8..10) |x| {
+            const cell = page.getRowAndCell(x, 16).cell;
+            cell.semantic_content = .prompt;
+        }
+    }
+
+    // Highlighting output with no following prompt
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 15 } }).?,
+        .output,
+    ).?;
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 15,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 7,
+        .y = 16,
+    } }, s.pointFromPin(.screen, hl.end).?);
+}
+
+test "PageList highlightSemanticContent output no output returns null" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5 with only prompt and input, no output
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        // First 3 cols are prompt
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+
+        // Rest is input (must explicitly mark all cells to avoid default .output)
+        for (3..10) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'c' },
+                .semantic_content = .input,
+            };
+        }
+    }
+    // Mark rows 6-9 as input to ensure no output between prompts
+    {
+        for (6..10) |y| {
+            for (0..10) |x| {
+                const cell = page.getRowAndCell(x, y).cell;
+                cell.semantic_content = .input;
+            }
+        }
+    }
+    // Prompt on row 10 (no output between prompts)
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Highlighting output should return null when there's no output
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .output,
+    );
+    try testing.expect(hl == null);
+}
+
+test "PageList highlightSemanticContent output skips empty cells" {
+    // Tests that empty cells with default .output semantic content are
+    // not selected as output. This can happen when a prompt/input line
+    // doesn't fill the entire row - trailing cells have default .output.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 20, 0);
+    defer s.deinit();
+    try testing.expect(s.pages.first == s.pages.last);
+    const page = &s.pages.first.?.data;
+
+    // Prompt on row 5 - only fills first 3 cells, rest are empty with default .output
+    {
+        const rac = page.getRowAndCell(0, 5);
+        rac.row.semantic_prompt = .prompt;
+
+        // First 3 cols are prompt with text
+        for (0..3) |x| {
+            const cell = page.getRowAndCell(x, 5).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = '$' },
+                .semantic_content = .prompt,
+            };
+        }
+        // Cells 3-9 are empty (codepoint = 0) with default .output semantic content
+        // This simulates what happens when a short prompt is written
+    }
+
+    // Row 6 has input (short, doesn't fill line)
+    {
+        for (0..4) |x| {
+            const cell = page.getRowAndCell(x, 6).cell;
+            cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'l' },
+                .semantic_content = .input,
+            };
+        }
+        // Cells 4-9 are empty with default .output
+    }
+
+    // Row 7-8 have actual output with text
+    {
+        for (7..9) |y| {
+            for (0..5) |x| {
+                const cell = page.getRowAndCell(x, y).cell;
+                cell.* = .{
+                    .content_tag = .codepoint,
+                    .content = .{ .codepoint = 'o' },
+                    .semantic_content = .output,
+                };
+            }
+        }
+    }
+
+    // Prompt on row 10
+    {
+        const rac = page.getRowAndCell(0, 10);
+        rac.row.semantic_prompt = .prompt;
+    }
+
+    // Highlighting output should skip empty cells on rows 5-6 and find
+    // the actual output starting at row 7
+    const hl = s.highlightSemanticContent(
+        s.pin(.{ .screen = .{ .x = 0, .y = 5 } }).?,
+        .output,
+    ).?;
+    // Output should start at row 7, not row 5 (where empty cells have default .output)
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 0,
+        .y = 7,
+    } }, s.pointFromPin(.screen, hl.start).?);
+    try testing.expectEqual(point.Point{ .screen = .{
+        .x = 4,
+        .y = 8,
+    } }, s.pointFromPin(.screen, hl.end).?);
 }
 
 test "PageList erase" {
@@ -8488,6 +10552,78 @@ test "PageList resize (no reflow) more cols with spacer head" {
             const rac = page.getRowAndCell(2, 0);
             try testing.expectEqual(@as(u21, 0), rac.cell.content.codepoint);
             try testing.expectEqual(pagepkg.Cell.Wide.narrow, rac.cell.wide);
+        }
+    }
+}
+
+// Regression test for fuzz crash. When we shrink cols and then
+// grow back, the page retains capacity from the original size so the grow
+// takes the fast path (just bumps page.size.cols). If any row has a
+// spacer_head at the old last column, that cell is no longer at the end
+// of the wider row, violating page integrity.
+test "PageList resize (no reflow) grow cols fast path with spacer head" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 3, 0);
+    defer s.deinit();
+
+    // Shrink to 5 cols. The page keeps capacity for 10 cols.
+    try s.resize(.{ .cols = 5, .reflow = false });
+    try testing.expectEqual(@as(usize, 5), s.cols);
+
+    // Place a spacer_head at the last column (col 4) on two rows
+    // to simulate a wide character that didn't fit at the right edge.
+    {
+        const page = &s.pages.first.?.data;
+
+        // Row 0: 'x' at col 0..3, spacer_head at col 4, wrap = true
+        {
+            const rac = page.getRowAndCell(0, 0);
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 'x' },
+            };
+        }
+        {
+            const rac = page.getRowAndCell(4, 0);
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 0 },
+                .wide = .spacer_head,
+            };
+            rac.row.wrap = true;
+        }
+
+        // Row 1: spacer_head at col 4, wrap = true
+        {
+            const rac = page.getRowAndCell(4, 1);
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = 0 },
+                .wide = .spacer_head,
+            };
+            rac.row.wrap = true;
+        }
+    }
+
+    // Grow back to 10 cols. This must not leave stale spacer_head
+    // cells at col 4 (which is no longer the last column).
+    try s.resize(.{ .cols = 10, .reflow = false });
+    try testing.expectEqual(@as(usize, 10), s.cols);
+
+    // Verify the old spacer_head positions are now narrow.
+    {
+        const page = &s.pages.first.?.data;
+        {
+            const rac = page.getRowAndCell(4, 0);
+            try testing.expectEqual(pagepkg.Cell.Wide.narrow, rac.cell.wide);
+            try testing.expect(!rac.row.wrap);
+        }
+        {
+            const rac = page.getRowAndCell(4, 1);
+            try testing.expectEqual(pagepkg.Cell.Wide.narrow, rac.cell.wide);
+            try testing.expect(!rac.row.wrap);
         }
     }
 }
@@ -11678,4 +13814,794 @@ test "PageList grow non-standard page prune protection" {
 
     // Verify the invariant holds - the fix prevents the destructive prune
     try testing.expect(s.totalRows() >= s.rows);
+}
+
+test "PageList resize (no reflow) more cols remaps pins in backfill path" {
+    // Regression test: when resizeWithoutReflowGrowCols copies rows to a previous
+    // page with spare capacity, tracked pins in those rows must be remapped.
+    // Without the fix, pins become dangling pointers when the original page is destroyed.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const cols: size.CellCountInt = 5;
+    const cap = try std_capacity.adjust(.{ .cols = cols });
+    var s = try init(alloc, cols, cap.rows, null);
+    defer s.deinit();
+
+    // Grow until we have two pages.
+    while (s.pages.first == s.pages.last) {
+        _ = try s.grow();
+    }
+    const first_page = s.pages.first.?;
+    const second_page = s.pages.last.?;
+    try testing.expect(first_page != second_page);
+
+    // Trim a history row so the first page has spare capacity.
+    // This triggers the backfill path in resizeWithoutReflowGrowCols.
+    s.eraseRows(.{ .history = .{} }, .{ .history = .{ .y = 0 } });
+    try testing.expect(first_page.data.size.rows < first_page.data.capacity.rows);
+
+    // Ensure the resize takes the slow path (new capacity > current capacity).
+    const new_cols: size.CellCountInt = cols + 1;
+    const adjusted = try second_page.data.capacity.adjust(.{ .cols = new_cols });
+    try testing.expect(second_page.data.capacity.cols < adjusted.cols);
+
+    // Track a pin in row 0 of the second page. This row will be copied
+    // to the first page during backfill and the pin must be remapped.
+    const tracked = try s.trackPin(.{ .node = second_page, .x = 0, .y = 0 });
+    defer s.untrackPin(tracked);
+
+    // Write a marker character to the tracked cell so we can verify
+    // the pin points to the correct cell after resize.
+    const marker: u21 = 'X';
+    tracked.rowAndCell().cell.* = .{
+        .content_tag = .codepoint,
+        .content = .{ .codepoint = marker },
+    };
+
+    try s.resize(.{ .cols = new_cols, .reflow = false });
+
+    // Verify the pin points to a valid node still in the page list.
+    var found = false;
+    var it = s.pages.first;
+    while (it) |node| : (it = node.next) {
+        if (node == tracked.node) {
+            found = true;
+            break;
+        }
+    }
+    try testing.expect(found);
+    try testing.expect(tracked.y < tracked.node.data.size.rows);
+
+    // Verify the pin still points to the cell with our marker content.
+    const cell = tracked.rowAndCell().cell;
+    try testing.expectEqual(.codepoint, cell.content_tag);
+    try testing.expectEqual(marker, cell.content.codepoint);
+}
+
+test "PageList compact std_size page returns null" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 80, 24, 0);
+    defer s.deinit();
+
+    // A freshly created page should be at std_size
+    const node = s.pages.first.?;
+    try testing.expect(node.data.memory.len <= std_size);
+
+    // compact should return null since there's nothing to compact
+    const result = try s.compact(node);
+    try testing.expectEqual(null, result);
+
+    // Page should still be the same
+    try testing.expectEqual(node, s.pages.first.?);
+}
+
+test "PageList compact oversized page" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 80, 24, null);
+    defer s.deinit();
+
+    // Grow until we have multiple pages
+    const page1_node = s.pages.first.?;
+    page1_node.data.pauseIntegrityChecks(true);
+    for (0..page1_node.data.capacity.rows - page1_node.data.size.rows) |_| {
+        _ = try s.grow();
+    }
+    page1_node.data.pauseIntegrityChecks(false);
+    _ = try s.grow();
+    try testing.expect(s.pages.first != s.pages.last);
+
+    var node = s.pages.first.?;
+
+    // Write content to verify it's preserved
+    {
+        const page = &node.data;
+        for (0..page.size.rows) |y| {
+            for (0..s.cols) |x| {
+                const rac = page.getRowAndCell(x, y);
+                rac.cell.* = .{
+                    .content_tag = .codepoint,
+                    .content = .{ .codepoint = @intCast(x + y * s.cols) },
+                };
+            }
+        }
+    }
+
+    // Create a tracked pin on this page
+    const tracked = try s.trackPin(.{ .node = node, .x = 5, .y = 10 });
+    defer s.untrackPin(tracked);
+
+    // Make the page oversized
+    while (node.data.memory.len <= std_size) {
+        node = try s.increaseCapacity(node, .grapheme_bytes);
+    }
+    try testing.expect(node.data.memory.len > std_size);
+    const oversized_len = node.data.memory.len;
+    const original_size = node.data.size;
+    const second_node = node.next.?;
+
+    // Set dirty flag after increaseCapacity
+    node.data.dirty = true;
+
+    // Compact the page
+    const new_node = try s.compact(node);
+    try testing.expect(new_node != null);
+
+    // Verify memory is smaller
+    try testing.expect(new_node.?.data.memory.len < oversized_len);
+
+    // Verify size preserved
+    try testing.expectEqual(original_size.rows, new_node.?.data.size.rows);
+    try testing.expectEqual(original_size.cols, new_node.?.data.size.cols);
+
+    // Verify dirty flag preserved
+    try testing.expect(new_node.?.data.dirty);
+
+    // Verify linked list integrity
+    try testing.expectEqual(new_node.?, s.pages.first.?);
+    try testing.expectEqual(null, new_node.?.prev);
+    try testing.expectEqual(second_node, new_node.?.next);
+    try testing.expectEqual(new_node.?, second_node.prev);
+
+    // Verify pin updated correctly
+    try testing.expectEqual(new_node.?, tracked.node);
+    try testing.expectEqual(@as(size.CellCountInt, 5), tracked.x);
+    try testing.expectEqual(@as(size.CellCountInt, 10), tracked.y);
+
+    // Verify content preserved
+    const page = &new_node.?.data;
+    for (0..page.size.rows) |y| {
+        for (0..s.cols) |x| {
+            const rac = page.getRowAndCell(x, y);
+            try testing.expectEqual(
+                @as(u21, @intCast(x + y * s.cols)),
+                rac.cell.content.codepoint,
+            );
+        }
+    }
+}
+
+test "PageList compact insufficient savings returns null" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 80, 24, 0);
+    defer s.deinit();
+
+    var node = s.pages.first.?;
+
+    // Make the page slightly oversized (just one increase)
+    // This might not provide enough savings to justify compaction
+    node = try s.increaseCapacity(node, .grapheme_bytes);
+
+    // If the page is still at or below std_size, compact returns null
+    if (node.data.memory.len <= std_size) {
+        const result = try s.compact(node);
+        try testing.expectEqual(null, result);
+    } else {
+        // If it did grow beyond std_size, verify that compaction
+        // works or returns null based on savings calculation
+        const result = try s.compact(node);
+        // Either it compacted or determined insufficient savings
+        if (result) |new_node| {
+            try testing.expect(new_node.data.memory.len < node.data.memory.len);
+        }
+    }
+}
+
+test "PageList split at middle row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    const page = &s.pages.first.?.data;
+
+    // Write content to rows: row 0 gets codepoint 0, row 1 gets 1, etc.
+    for (0..page.size.rows) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = @intCast(y) },
+        };
+    }
+
+    // Split at row 5 (middle)
+    const split_pin: Pin = .{ .node = s.pages.first.?, .y = 5, .x = 0 };
+    try s.split(split_pin);
+
+    // Verify two pages exist
+    try testing.expect(s.pages.first != null);
+    try testing.expect(s.pages.first.?.next != null);
+
+    const first_page = &s.pages.first.?.data;
+    const second_page = &s.pages.first.?.next.?.data;
+
+    // First page should have rows 0-4 (5 rows)
+    try testing.expectEqual(@as(usize, 5), first_page.size.rows);
+    // Second page should have rows 5-9 (5 rows)
+    try testing.expectEqual(@as(usize, 5), second_page.size.rows);
+
+    // Verify content in first page is preserved (rows 0-4 have codepoints 0-4)
+    for (0..5) |y| {
+        const rac = first_page.getRowAndCell(0, y);
+        try testing.expectEqual(@as(u21, @intCast(y)), rac.cell.content.codepoint);
+    }
+
+    // Verify content in second page (original rows 5-9, now at y=0-4)
+    for (0..5) |y| {
+        const rac = second_page.getRowAndCell(0, y);
+        try testing.expectEqual(@as(u21, @intCast(y + 5)), rac.cell.content.codepoint);
+    }
+}
+
+test "PageList split at row 0 is no-op" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    const page = &s.pages.first.?.data;
+
+    // Write content to all rows
+    for (0..page.size.rows) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = @intCast(y) },
+        };
+    }
+
+    // Split at row 0 should be a no-op
+    const split_pin: Pin = .{ .node = s.pages.first.?, .y = 0, .x = 0 };
+    try s.split(split_pin);
+
+    // Verify only one page exists (no split occurred)
+    try testing.expect(s.pages.first != null);
+    try testing.expect(s.pages.first.?.next == null);
+
+    // Verify all content is still in the original page
+    try testing.expectEqual(@as(usize, 10), page.size.rows);
+    for (0..10) |y| {
+        const rac = page.getRowAndCell(0, y);
+        try testing.expectEqual(@as(u21, @intCast(y)), rac.cell.content.codepoint);
+    }
+}
+
+test "PageList split at last row" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    const page = &s.pages.first.?.data;
+
+    // Write content to all rows
+    for (0..page.size.rows) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = @intCast(y) },
+        };
+    }
+
+    // Split at last row (row 9)
+    const split_pin: Pin = .{ .node = s.pages.first.?, .y = 9, .x = 0 };
+    try s.split(split_pin);
+
+    // Verify two pages exist
+    try testing.expect(s.pages.first != null);
+    try testing.expect(s.pages.first.?.next != null);
+
+    const first_page = &s.pages.first.?.data;
+    const second_page = &s.pages.first.?.next.?.data;
+
+    // First page should have 9 rows
+    try testing.expectEqual(@as(usize, 9), first_page.size.rows);
+    // Second page should have 1 row
+    try testing.expectEqual(@as(usize, 1), second_page.size.rows);
+
+    // Verify content in second page (original row 9, now at y=0)
+    const rac = second_page.getRowAndCell(0, 0);
+    try testing.expectEqual(@as(u21, 9), rac.cell.content.codepoint);
+}
+
+test "PageList split single row page returns OutOfSpace" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Initialize with 1 row
+    var s = try init(alloc, 10, 1, 0);
+    defer s.deinit();
+
+    const split_pin: Pin = .{ .node = s.pages.first.?, .y = 0, .x = 0 };
+    const result = s.split(split_pin);
+
+    try testing.expectError(error.OutOfSpace, result);
+}
+
+test "PageList split moves tracked pins" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    // Track a pin at row 7
+    const tracked = try s.trackPin(.{ .node = s.pages.first.?, .y = 7, .x = 3 });
+    defer s.untrackPin(tracked);
+
+    // Split at row 5
+    const split_pin: Pin = .{ .node = s.pages.first.?, .y = 5, .x = 0 };
+    try s.split(split_pin);
+
+    // The tracked pin should now be in the second page
+    try testing.expect(tracked.node == s.pages.first.?.next.?);
+    // y should be adjusted: was 7, split at 5, so new y = 7 - 5 = 2
+    try testing.expectEqual(@as(usize, 2), tracked.y);
+    // x should remain unchanged
+    try testing.expectEqual(@as(usize, 3), tracked.x);
+}
+
+test "PageList split tracked pin before split point unchanged" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    const original_node = s.pages.first.?;
+
+    // Track a pin at row 2 (before the split point)
+    const tracked = try s.trackPin(.{ .node = original_node, .y = 2, .x = 5 });
+    defer s.untrackPin(tracked);
+
+    // Split at row 5
+    const split_pin: Pin = .{ .node = original_node, .y = 5, .x = 0 };
+    try s.split(split_pin);
+
+    // The tracked pin should remain in the original page
+    try testing.expect(tracked.node == s.pages.first.?);
+    // y and x should be unchanged
+    try testing.expectEqual(@as(usize, 2), tracked.y);
+    try testing.expectEqual(@as(usize, 5), tracked.x);
+}
+
+test "PageList split tracked pin at split point moves to new page" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    const original_node = s.pages.first.?;
+
+    // Track a pin at the exact split point (row 5)
+    const tracked = try s.trackPin(.{ .node = original_node, .y = 5, .x = 4 });
+    defer s.untrackPin(tracked);
+
+    // Split at row 5
+    const split_pin: Pin = .{ .node = original_node, .y = 5, .x = 0 };
+    try s.split(split_pin);
+
+    // The tracked pin should be in the new page
+    try testing.expect(tracked.node == s.pages.first.?.next.?);
+    // y should be 0 since it was at the split point: 5 - 5 = 0
+    try testing.expectEqual(@as(usize, 0), tracked.y);
+    // x should remain unchanged
+    try testing.expectEqual(@as(usize, 4), tracked.x);
+}
+
+test "PageList split multiple tracked pins across regions" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    const original_node = s.pages.first.?;
+
+    // Track multiple pins in different regions
+    const pin_before = try s.trackPin(.{ .node = original_node, .y = 1, .x = 0 });
+    defer s.untrackPin(pin_before);
+    const pin_at_split = try s.trackPin(.{ .node = original_node, .y = 5, .x = 2 });
+    defer s.untrackPin(pin_at_split);
+    const pin_after1 = try s.trackPin(.{ .node = original_node, .y = 7, .x = 3 });
+    defer s.untrackPin(pin_after1);
+    const pin_after2 = try s.trackPin(.{ .node = original_node, .y = 9, .x = 8 });
+    defer s.untrackPin(pin_after2);
+
+    // Split at row 5
+    const split_pin: Pin = .{ .node = original_node, .y = 5, .x = 0 };
+    try s.split(split_pin);
+
+    const first_page = s.pages.first.?;
+    const second_page = first_page.next.?;
+
+    // Pin before split point stays in original page
+    try testing.expect(pin_before.node == first_page);
+    try testing.expectEqual(@as(usize, 1), pin_before.y);
+    try testing.expectEqual(@as(usize, 0), pin_before.x);
+
+    // Pin at split point moves to new page with y=0
+    try testing.expect(pin_at_split.node == second_page);
+    try testing.expectEqual(@as(usize, 0), pin_at_split.y);
+    try testing.expectEqual(@as(usize, 2), pin_at_split.x);
+
+    // Pins after split point move to new page with adjusted y
+    try testing.expect(pin_after1.node == second_page);
+    try testing.expectEqual(@as(usize, 2), pin_after1.y); // 7 - 5 = 2
+    try testing.expectEqual(@as(usize, 3), pin_after1.x);
+
+    try testing.expect(pin_after2.node == second_page);
+    try testing.expectEqual(@as(usize, 4), pin_after2.y); // 9 - 5 = 4
+    try testing.expectEqual(@as(usize, 8), pin_after2.x);
+}
+
+test "PageList split tracked viewport_pin in split region moves correctly" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    const original_node = s.pages.first.?;
+
+    // Set viewport_pin to row 7 (after split point)
+    s.viewport_pin.node = original_node;
+    s.viewport_pin.y = 7;
+    s.viewport_pin.x = 6;
+
+    // Split at row 5
+    const split_pin: Pin = .{ .node = original_node, .y = 5, .x = 0 };
+    try s.split(split_pin);
+
+    // viewport_pin should be in the new page
+    try testing.expect(s.viewport_pin.node == s.pages.first.?.next.?);
+    // y should be adjusted: 7 - 5 = 2
+    try testing.expectEqual(@as(usize, 2), s.viewport_pin.y);
+    // x should remain unchanged
+    try testing.expectEqual(@as(usize, 6), s.viewport_pin.x);
+}
+
+test "PageList split middle page preserves linked list order" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Create a single page with 12 rows
+    var s = try init(alloc, 10, 12, 0);
+    defer s.deinit();
+
+    // Split at row 4 to create: page1 (rows 0-3), page2 (rows 4-11)
+    const first_node = s.pages.first.?;
+    const split_pin1: Pin = .{ .node = first_node, .y = 4, .x = 0 };
+    try s.split(split_pin1);
+
+    // Now we have 2 pages
+    const page1 = s.pages.first.?;
+    const page2 = s.pages.first.?.next.?;
+    try testing.expectEqual(@as(usize, 4), page1.data.size.rows);
+    try testing.expectEqual(@as(usize, 8), page2.data.size.rows);
+
+    // Split page2 at row 4 to create: page1 -> page2 (rows 0-3) -> page3 (rows 4-7)
+    const split_pin2: Pin = .{ .node = page2, .y = 4, .x = 0 };
+    try s.split(split_pin2);
+
+    // Now we have 3 pages
+    const first = s.pages.first.?;
+    const middle = first.next.?;
+    const last = middle.next.?;
+
+    // Verify linked list order: first -> middle -> last
+    try testing.expectEqual(page1, first);
+    try testing.expectEqual(page2, middle);
+    try testing.expectEqual(s.pages.last.?, last);
+
+    // Verify prev pointers
+    try testing.expect(first.prev == null);
+    try testing.expectEqual(first, middle.prev.?);
+    try testing.expectEqual(middle, last.prev.?);
+
+    // Verify next pointers
+    try testing.expectEqual(middle, first.next.?);
+    try testing.expectEqual(last, middle.next.?);
+    try testing.expect(last.next == null);
+
+    // Verify row counts
+    try testing.expectEqual(@as(usize, 4), first.data.size.rows);
+    try testing.expectEqual(@as(usize, 4), middle.data.size.rows);
+    try testing.expectEqual(@as(usize, 4), last.data.size.rows);
+}
+
+test "PageList split last page makes new page the last" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Create a single page with 10 rows
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    // Split to create 2 pages first
+    const first_node = s.pages.first.?;
+    const split_pin1: Pin = .{ .node = first_node, .y = 5, .x = 0 };
+    try s.split(split_pin1);
+
+    // Now split the last page
+    const last_before_split = s.pages.last.?;
+    try testing.expectEqual(@as(usize, 5), last_before_split.data.size.rows);
+
+    const split_pin2: Pin = .{ .node = last_before_split, .y = 2, .x = 0 };
+    try s.split(split_pin2);
+
+    // The new page should be the new last
+    const new_last = s.pages.last.?;
+    try testing.expect(new_last != last_before_split);
+    try testing.expectEqual(last_before_split, new_last.prev.?);
+    try testing.expect(new_last.next == null);
+
+    // Verify row counts: original last has 2 rows, new last has 3 rows
+    try testing.expectEqual(@as(usize, 2), last_before_split.data.size.rows);
+    try testing.expectEqual(@as(usize, 3), new_last.data.size.rows);
+}
+
+test "PageList split first page keeps original as first" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Create 2 pages by splitting
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    const original_first = s.pages.first.?;
+    const split_pin1: Pin = .{ .node = original_first, .y = 5, .x = 0 };
+    try s.split(split_pin1);
+
+    // Get second page (created by first split)
+    const second_page = s.pages.first.?.next.?;
+
+    // Now split the first page again
+    const split_pin2: Pin = .{ .node = s.pages.first.?, .y = 2, .x = 0 };
+    try s.split(split_pin2);
+
+    // Original first should still be first
+    try testing.expectEqual(original_first, s.pages.first.?);
+    try testing.expect(s.pages.first.?.prev == null);
+
+    // New page should be inserted between first and second
+    const inserted = s.pages.first.?.next.?;
+    try testing.expect(inserted != second_page);
+    try testing.expectEqual(second_page, inserted.next.?);
+
+    // Verify row counts: first has 2, inserted has 3, second has 5
+    try testing.expectEqual(@as(usize, 2), s.pages.first.?.data.size.rows);
+    try testing.expectEqual(@as(usize, 3), inserted.data.size.rows);
+    try testing.expectEqual(@as(usize, 5), second_page.data.size.rows);
+}
+
+test "PageList split preserves wrap flags" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    const page = &s.pages.first.?.data;
+
+    // Set wrap flags on rows that will be in the second page after split
+    // Row 5: wrap = true (this is the start of a wrapped line)
+    // Row 6: wrap_continuation = true (this continues the wrap)
+    // Row 7: wrap = true, wrap_continuation = true (wrapped and continues)
+    {
+        const rac5 = page.getRowAndCell(0, 5);
+        rac5.row.wrap = true;
+
+        const rac6 = page.getRowAndCell(0, 6);
+        rac6.row.wrap_continuation = true;
+
+        const rac7 = page.getRowAndCell(0, 7);
+        rac7.row.wrap = true;
+        rac7.row.wrap_continuation = true;
+    }
+
+    // Split at row 5
+    const split_pin: Pin = .{ .node = s.pages.first.?, .y = 5, .x = 0 };
+    try s.split(split_pin);
+
+    const second_page = &s.pages.first.?.next.?.data;
+
+    // Verify wrap flags are preserved in new page
+    // Original row 5 is now row 0 in second page
+    {
+        const rac0 = second_page.getRowAndCell(0, 0);
+        try testing.expect(rac0.row.wrap);
+        try testing.expect(!rac0.row.wrap_continuation);
+    }
+
+    // Original row 6 is now row 1 in second page
+    {
+        const rac1 = second_page.getRowAndCell(0, 1);
+        try testing.expect(!rac1.row.wrap);
+        try testing.expect(rac1.row.wrap_continuation);
+    }
+
+    // Original row 7 is now row 2 in second page
+    {
+        const rac2 = second_page.getRowAndCell(0, 2);
+        try testing.expect(rac2.row.wrap);
+        try testing.expect(rac2.row.wrap_continuation);
+    }
+}
+
+test "PageList split preserves styled cells" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    const page = &s.pages.first.?.data;
+
+    // Create a style and apply it to cells in rows 5-7 (which will be in the second page)
+    const style: stylepkg.Style = .{ .flags = .{ .bold = true } };
+    const style_id = try page.styles.add(page.memory, style);
+
+    for (5..8) |y| {
+        const rac = page.getRowAndCell(0, y);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = 'S' },
+            .style_id = style_id,
+        };
+        rac.row.styled = true;
+        page.styles.use(page.memory, style_id);
+    }
+    // Release the extra ref from add
+    page.styles.release(page.memory, style_id);
+
+    // Split at row 5
+    const split_pin: Pin = .{ .node = s.pages.first.?, .y = 5, .x = 0 };
+    try s.split(split_pin);
+
+    const first_page = &s.pages.first.?.data;
+    const second_page = &s.pages.first.?.next.?.data;
+
+    // First page should have no styles (all styled rows moved to second page)
+    try testing.expectEqual(@as(usize, 0), first_page.styles.count());
+
+    // Second page should have exactly 1 style (the bold style, used by 3 cells)
+    try testing.expectEqual(@as(usize, 1), second_page.styles.count());
+
+    // Verify styled cells are preserved in new page
+    for (0..3) |y| {
+        const rac = second_page.getRowAndCell(0, y);
+        try testing.expectEqual(@as(u21, 'S'), rac.cell.content.codepoint);
+        try testing.expect(rac.cell.style_id != 0);
+
+        const got_style = second_page.styles.get(second_page.memory, rac.cell.style_id);
+        try testing.expect(got_style.flags.bold);
+        try testing.expect(rac.row.styled);
+    }
+}
+
+test "PageList split preserves grapheme clusters" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    const page = &s.pages.first.?.data;
+
+    // Add a grapheme cluster to row 6 (will be row 1 in second page after split at 5)
+    {
+        const rac = page.getRowAndCell(0, 6);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = 0x1F468 }, // Man emoji
+        };
+        try page.setGraphemes(rac.row, rac.cell, &.{
+            0x200D, // ZWJ
+            0x1F469, // Woman emoji
+        });
+    }
+
+    // Split at row 5
+    const split_pin: Pin = .{ .node = s.pages.first.?, .y = 5, .x = 0 };
+    try s.split(split_pin);
+
+    const first_page = &s.pages.first.?.data;
+    const second_page = &s.pages.first.?.next.?.data;
+
+    // First page should have no graphemes (the grapheme row moved to second page)
+    try testing.expectEqual(@as(usize, 0), first_page.graphemeCount());
+
+    // Second page should have exactly 1 grapheme
+    try testing.expectEqual(@as(usize, 1), second_page.graphemeCount());
+
+    // Verify grapheme is preserved in new page (original row 6 is now row 1)
+    {
+        const rac = second_page.getRowAndCell(0, 1);
+        try testing.expectEqual(@as(u21, 0x1F468), rac.cell.content.codepoint);
+        try testing.expect(rac.row.grapheme);
+
+        const cps = second_page.lookupGrapheme(rac.cell).?;
+        try testing.expectEqual(@as(usize, 2), cps.len);
+        try testing.expectEqual(@as(u21, 0x200D), cps[0]);
+        try testing.expectEqual(@as(u21, 0x1F469), cps[1]);
+    }
+}
+
+test "PageList split preserves hyperlinks" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var s = try init(alloc, 10, 10, 0);
+    defer s.deinit();
+
+    const page = &s.pages.first.?.data;
+
+    // Add a hyperlink to row 7 (will be row 2 in second page after split at 5)
+    const hyperlink_id = try page.insertHyperlink(.{
+        .id = .{ .implicit = 0 },
+        .uri = "https://example.com",
+    });
+    {
+        const rac = page.getRowAndCell(0, 7);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = 'L' },
+        };
+        try page.setHyperlink(rac.row, rac.cell, hyperlink_id);
+    }
+
+    // Split at row 5
+    const split_pin: Pin = .{ .node = s.pages.first.?, .y = 5, .x = 0 };
+    try s.split(split_pin);
+
+    const first_page = &s.pages.first.?.data;
+    const second_page = &s.pages.first.?.next.?.data;
+
+    // First page should have no hyperlinks (the hyperlink row moved to second page)
+    try testing.expectEqual(@as(usize, 0), first_page.hyperlink_set.count());
+
+    // Second page should have exactly 1 hyperlink
+    try testing.expectEqual(@as(usize, 1), second_page.hyperlink_set.count());
+
+    // Verify hyperlink is preserved in new page (original row 7 is now row 2)
+    {
+        const rac = second_page.getRowAndCell(0, 2);
+        try testing.expectEqual(@as(u21, 'L'), rac.cell.content.codepoint);
+        try testing.expect(rac.cell.hyperlink);
+
+        const link_id = second_page.lookupHyperlink(rac.cell).?;
+        const link = second_page.hyperlink_set.get(second_page.memory, link_id);
+        try testing.expectEqualStrings("https://example.com", link.uri.slice(second_page.memory));
+    }
 }

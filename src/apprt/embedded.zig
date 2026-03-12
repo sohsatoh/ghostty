@@ -50,10 +50,11 @@ pub const App = struct {
         /// Callback called to handle an action.
         action: *const fn (*App, apprt.Target.C, apprt.Action.C) callconv(.c) bool,
 
-        /// Read the clipboard value. The return value must be preserved
-        /// by the host until the next call. If there is no valid clipboard
-        /// value then this should return null.
-        read_clipboard: *const fn (SurfaceUD, c_int, *apprt.ClipboardRequest) callconv(.c) void,
+        /// Read the clipboard value. Returns true if the clipboard request
+        /// was started and complete_clipboard_request may be called with the
+        /// given state pointer. Returns false if the clipboard request couldn't
+        /// be started (such as when no text is available for a paste request).
+        read_clipboard: *const fn (SurfaceUD, c_int, *apprt.ClipboardRequest) callconv(.c) bool,
 
         /// This may be called after a read clipboard call to request
         /// confirmation that the clipboard value is safe to read. The embedder
@@ -512,7 +513,15 @@ pub const Surface = struct {
                     break :wd;
                 }
 
-                config.@"working-directory" = wd;
+                var wd_val: configpkg.WorkingDirectory = .{ .path = wd };
+                if (wd_val.finalize(config.arenaAlloc())) |_| {
+                    config.@"working-directory" = wd_val;
+                } else |err| {
+                    log.warn(
+                        "error finalizing working directory config dir={s} err={}",
+                        .{ wd_val.path, err },
+                    );
+                }
             }
         }
 
@@ -672,14 +681,16 @@ pub const Surface = struct {
         errdefer alloc.destroy(state_ptr);
         state_ptr.* = state;
 
-        self.app.opts.read_clipboard(
+        const started = self.app.opts.read_clipboard(
             self.userdata,
             @intCast(@intFromEnum(clipboard_type)),
             state_ptr,
         );
+        if (!started) {
+            alloc.destroy(state_ptr);
+            return false;
+        }
 
-        // Embedded apprt can't synchronously check clipboard content types,
-        // so we always return true to indicate the request was started.
         return true;
     }
 
@@ -848,7 +859,7 @@ pub const Surface = struct {
         mods: input.Mods,
     ) void {
         // Convert our unscaled x/y to scaled.
-        self.cursor_pos = self.cursorPosToPixels(.{
+        const pos = self.cursorPosToPixels(.{
             .x = @floatCast(x),
             .y = @floatCast(y),
         }) catch |err| {
@@ -858,6 +869,19 @@ pub const Surface = struct {
             );
             return;
         };
+
+        // There are cases where the platform reports a mouse motion event
+        // without the cursor actually moving. For example, on macOS, updating
+        // the window title can trigger a phantom mouse-move event at the same
+        // coordinates. This can cause the mouse to incorrectly unhide when
+        // mouse-hide-while-typing is enabled (commonly seen with TUI apps
+        // like Zellij that frequently update the title). To prevent incorrect
+        // behavior, we only continue with callback logic if the cursor has
+        // actually moved.
+        if (@abs(self.cursor_pos.x - pos.x) < 1 and
+            @abs(self.cursor_pos.y - pos.y) < 1) return;
+
+        self.cursor_pos = pos;
 
         self.core_surface.cursorPosCallback(self.cursor_pos, mods) catch |err| {
             log.err("error in cursor pos callback err={}", .{err});
@@ -1061,7 +1085,7 @@ pub const Inspector = struct {
             render: {
                 const surface = &self.surface.core_surface;
                 const inspector = surface.inspector orelse break :render;
-                inspector.render();
+                inspector.render(surface);
             }
 
             // Render
@@ -1133,15 +1157,18 @@ pub const Inspector = struct {
         yoff: f64,
         mods: input.ScrollMods,
     ) void {
-        _ = mods;
-
         self.queueRender();
         cimgui.c.ImGui_SetCurrentContext(self.ig_ctx);
         const io: *cimgui.c.ImGuiIO = cimgui.c.ImGui_GetIO();
+
+        // For precision scrolling (trackpads), the values are in pixels which
+        // scroll way too fast. Scale them down to approximate discrete wheel
+        // notches. imgui expects 1.0 to scroll ~5 lines of text.
+        const scale: f64 = if (mods.precision) 0.1 else 1.0;
         cimgui.c.ImGuiIO_AddMouseWheelEvent(
             io,
-            @floatCast(xoff),
-            @floatCast(yoff),
+            @floatCast(xoff * scale),
+            @floatCast(yoff * scale),
         );
     }
 
@@ -1202,10 +1229,11 @@ pub const Inspector = struct {
         // Determine our delta time
         const now = try std.time.Instant.now();
         io.DeltaTime = if (self.instant) |prev| delta: {
-            const since_ns = now.since(prev);
-            const since_s: f32 = @floatFromInt(since_ns / std.time.ns_per_s);
+            const since_ns: f64 = @floatFromInt(now.since(prev));
+            const ns_per_s: f64 = @floatFromInt(std.time.ns_per_s);
+            const since_s: f32 = @floatCast(since_ns / ns_per_s);
             break :delta @max(0.00001, since_s);
-        } else (1 / 60);
+        } else (1.0 / 60.0);
         self.instant = now;
     }
 };
@@ -2165,7 +2193,10 @@ pub const CAPI = struct {
                     if (comptime std.debug.runtime_safety) unreachable;
                     return false;
                 };
-                break :sel surface.io.terminal.screens.active.selectWord(pin) orelse return false;
+                break :sel surface.io.terminal.screens.active.selectWord(
+                    pin,
+                    surface.config.selection_word_chars,
+                ) orelse return false;
             };
 
             // Read the selection
