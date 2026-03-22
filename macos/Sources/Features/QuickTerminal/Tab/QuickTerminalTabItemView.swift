@@ -9,6 +9,7 @@ struct QuickTerminalTabItemView: View {
     let onClose: () -> Void
 
     @State private var isHovered = false
+    @State private var animationOffset: CGFloat = 0
 
     var body: some View {
         HStack(spacing: 4) {
@@ -51,6 +52,26 @@ struct QuickTerminalTabItemView: View {
                         ? Color(NSColor.controlBackgroundColor)
                         : (isHovered ? Color(NSColor.underPageBackgroundColor) : Color(NSColor.windowBackgroundColor)))
         )
+        .overlay(alignment: .bottom) {
+            if tab.commandRunning {
+                GeometryReader { geometry in
+                    Capsule()
+                        .fill(Color.accentColor)
+                        .frame(width: geometry.size.width * 0.3, height: 2)
+                        .offset(x: geometry.size.width * 0.7 * animationOffset)
+                }
+                .frame(height: 2)
+                .onAppear {
+                    animationOffset = 0
+                    withAnimation(.easeInOut(duration: 1.0).repeatForever(autoreverses: true)) {
+                        animationOffset = 1.0
+                    }
+                }
+                .onDisappear {
+                    animationOffset = 0
+                }
+            }
+        }
         .onHover { hovering in
             isHovered = hovering
         }

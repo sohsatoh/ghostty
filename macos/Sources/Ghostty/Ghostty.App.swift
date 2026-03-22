@@ -7,6 +7,10 @@ protocol GhosttyAppDelegate: AnyObject {
     /// Called when a callback needs access to a specific surface. This should return nil
     /// when the surface is no longer valid.
     func findSurface(forUUID uuid: UUID) -> Ghostty.SurfaceView?
+
+    /// Show the quick terminal and switch to the tab containing the surface with the given UUID.
+    /// Returns true if the surface was found in a quick terminal tab and activated.
+    func showQuickTerminalSurface(forUUID uuid: UUID) -> Bool
     #endif
 }
 
@@ -442,8 +446,11 @@ extension Ghostty {
             // We always require the notification to be attached to a surface.
             guard let uuidString = userInfo["surface"] as? String,
                   let uuid = UUID(uuidString: uuidString),
-                  let surface = delegate?.findSurface(forUUID: uuid),
-                  let window = surface.window else { return false }
+                  let surface = delegate?.findSurface(forUUID: uuid) else { return false }
+
+            // If the surface has no window (e.g., inactive quick terminal tab),
+            // always present the notification since the user can't see it.
+            guard let window = surface.window else { return true }
 
             // If we don't require focus then we're good!
             let requireFocus = userInfo["requireFocus"] as? Bool ?? true
@@ -646,6 +653,9 @@ extension Ghostty {
 
             case GHOSTTY_ACTION_SEARCH_SELECTED:
                 searchSelected(app, target: target, v: action.action.search_selected)
+
+            case GHOSTTY_ACTION_COMMAND_STARTED:
+                commandStarted(app, target: target)
 
             case GHOSTTY_ACTION_COMMAND_FINISHED:
                 commandFinished(app, target: target, v: action.action.command_finished)
@@ -1414,6 +1424,24 @@ extension Ghostty {
             }
         }
 
+        private static func commandStarted(
+            _ app: ghostty_app_t,
+            target: ghostty_target_s
+        ) {
+            switch target.tag {
+            case GHOSTTY_TARGET_APP:
+                return
+
+            case GHOSTTY_TARGET_SURFACE:
+                guard let surface = target.target.surface else { return }
+                guard let surfaceView = self.surfaceView(from: surface) else { return }
+                surfaceView.commandRunning = true
+
+            default:
+                assertionFailure()
+            }
+        }
+
         private static func commandFinished(
             _ app: ghostty_app_t,
             target: ghostty_target_s,
@@ -1427,6 +1455,9 @@ extension Ghostty {
             case GHOSTTY_TARGET_SURFACE:
                 guard let surface = target.target.surface else { return }
                 guard let surfaceView = self.surfaceView(from: surface) else { return }
+
+                // Always clear command running state
+                surfaceView.commandRunning = false
 
                 // Determine if we even care about command finish notifications
                 guard let config = (NSApplication.shared.delegate as? AppDelegate)?.ghostty.config else { return }
@@ -2231,8 +2262,17 @@ extension Ghostty {
 
             switch response.actionIdentifier {
             case UNNotificationDefaultActionIdentifier, Ghostty.userNotificationActionShow:
-                // The user clicked on a notification
-                surface.handleUserNotification(notification: response.notification, focus: true)
+                // Try quick terminal first - the surface may be in an inactive tab
+                if delegate?.showQuickTerminalSurface(forUUID: uuid) == true {
+                    // Clear notification state without focusing (QT handles focus)
+                    surface.handleUserNotification(notification: response.notification, focus: false)
+                    // Focus the surface after the tab switch completes
+                    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) {
+                        Ghostty.moveFocus(to: surface)
+                    }
+                } else {
+                    surface.handleUserNotification(notification: response.notification, focus: true)
+                }
             case UNNotificationDismissActionIdentifier:
                 // The user dismissed the notification
                 surface.handleUserNotification(notification: response.notification, focus: false)

@@ -29,6 +29,9 @@ extension Ghostty {
         // changed with escape codes.
         @Published var pwd: String?
 
+        // Whether a command is currently running in this surface (OSC 133C/D).
+        @Published var commandRunning: Bool = false
+
         // The cell size of this surface. This is set by the core when the
         // surface is first created and any time the cell size changes (i.e.
         // when the font size changes). This is used to allow windows to be

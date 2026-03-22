@@ -6,6 +6,7 @@ class QuickTerminalTab: ObservableObject, Identifiable {
     var surfaceTree: SplitTree<Ghostty.SurfaceView>
     @Published var title: String
     @Published var pwd: String?
+    @Published var commandRunning: Bool = false
     @Published var isActive: Bool = false
 
     private var cancellables = Set<AnyCancellable>()
@@ -31,6 +32,14 @@ class QuickTerminalTab: ObservableObject, Identifiable {
                 .receive(on: DispatchQueue.main)
                 .sink { [weak self] newPwd in
                     self?.pwd = newPwd
+                }
+                .store(in: &cancellables)
+
+            // Subscribe to command running state
+            firstView.$commandRunning
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] running in
+                    self?.commandRunning = running
                 }
                 .store(in: &cancellables)
         } else {
