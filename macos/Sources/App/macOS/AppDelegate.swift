@@ -917,7 +917,26 @@ class AppDelegate: NSObject,
             }
         }
 
+        // Search quick terminal tabs (only if controller is already initialized)
+        switch quickTerminalControllerState {
+        case .initialized(let controller):
+            if let result = controller.findSurface(forUUID: uuid) {
+                return result.surface
+            }
+        case .pendingRestore, .uninitialized:
+            break
+        }
+
         return nil
+    }
+
+    func showQuickTerminalSurface(forUUID uuid: UUID) -> Bool {
+        switch quickTerminalControllerState {
+        case .initialized(let controller):
+            return controller.showSurface(forUUID: uuid)
+        case .pendingRestore, .uninitialized:
+            return false
+        }
     }
 
     // MARK: - Global State

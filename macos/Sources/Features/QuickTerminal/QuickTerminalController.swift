@@ -737,6 +737,28 @@ class QuickTerminalController: BaseTerminalController {
         tabManager.newTab()
     }
 
+    /// Find a surface view by UUID across all quick terminal tabs.
+    /// Returns the surface and the tab it belongs to, or nil if not found.
+    func findSurface(forUUID uuid: UUID) -> (surface: Ghostty.SurfaceView, tab: QuickTerminalTab)? {
+        for tab in tabManager.tabs {
+            for view in tab.surfaceTree where view.id == uuid {
+                return (view, tab)
+            }
+        }
+        return nil
+    }
+
+    /// Show the quick terminal and switch to the tab containing the given surface.
+    /// Returns true if the surface was found and the tab was activated.
+    func showSurface(forUUID uuid: UUID) -> Bool {
+        guard let result = findSurface(forUUID: uuid) else { return false }
+        tabManager.selectTab(result.tab)
+        if !visible {
+            animateIn()
+        }
+        return true
+    }
+
     /// Switch to a tab by 1-based index. Called from QuickTerminalWindow's
     /// performKeyEquivalent for Cmd+number shortcuts.
     func gotoTab(index: Int) {
