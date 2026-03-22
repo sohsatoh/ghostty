@@ -38,10 +38,16 @@ class QuickTerminalController: BaseTerminalController {
     let restorable: Bool
     private var restorationState: QuickTerminalRestorableState?
 
+    // The tab manager for the quick terminal
+    private lazy var tabManager: QuickTerminalTabManager = {
+        let manager = QuickTerminalTabManager(controller: self)
+        return manager
+    }()
+
     init(_ ghostty: Ghostty.App,
          position: QuickTerminalPosition = .top,
          baseConfig base: Ghostty.SurfaceConfiguration? = nil,
-         restorationState: QuickTerminalRestorableState? = nil,
+         restorationState: QuickTerminalRestorableState? = nil
     ) {
         self.position = position
         self.derivedConfig = DerivedConfig(ghostty.config)
@@ -91,6 +97,16 @@ class QuickTerminalController: BaseTerminalController {
             selector: #selector(windowDidResize(_:)),
             name: NSWindow.didResizeNotification,
             object: nil)
+        center.addObserver(
+            tabManager,
+            selector: #selector(tabManager.onMoveTab(_:)),
+            name: .ghosttyMoveTab,
+            object: nil)
+        center.addObserver(
+            tabManager,
+            selector: #selector(tabManager.onGoToTab(_:)),
+            name: Ghostty.Notification.ghosttyGotoTab,
+            object: nil)
     }
 
     required init?(coder: NSCoder) {
@@ -136,18 +152,30 @@ class QuickTerminalController: BaseTerminalController {
             qtWindow.initialFrame = window.frame
         }
 
-        // Setup our content
-        window.contentView = TerminalViewContainer {
-            TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
+        DispatchQueue.main.async {
+            self.setupMainView()
+            self.animateIn()
         }
+    }
+
+    private func setupMainView() {
+        guard let window = self.window else { return }
 
         // Clear out our frame at this point, the fixup from above is complete.
         if let qtWindow = window as? QuickTerminalWindow {
             qtWindow.initialFrame = nil
         }
 
-        // Animate the window in
-        animateIn()
+        let mainContent = VStack(spacing: 0) {
+            QuickTerminalTabBarView(tabManager: tabManager)
+            TerminalView(
+                ghostty: ghostty,
+                viewModel: self,
+                delegate: self
+            )
+        }
+
+        window.contentView = NSHostingView(rootView: mainContent)
     }
 
     // MARK: NSWindowDelegate
@@ -271,10 +299,21 @@ class QuickTerminalController: BaseTerminalController {
     override func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
         super.surfaceTreeDidChange(from: from, to: to)
 
-        // If our surface tree is nil then we animate the window out. We
-        // defer reinitializing the tree to save some memory here.
+        // If our surface tree is empty then check if we have tabs with invalid surfaces
         if to.isEmpty {
-            animateOut()
+            // Check if any tabs have surfaces that are now invalid (closed)
+            let invalidTabs = tabManager.tabs.filter { tab in
+                tab.surfaceTree.isEmpty || tab.surfaceTree.first(where: { $0.surface != nil }) == nil
+            }
+            
+            for tab in invalidTabs {
+                tabManager.closeTab(tab)
+            }
+            
+            // If all tabs are closed, animate out
+            if tabManager.tabs.isEmpty {
+                animateOut()
+            }
             return
         }
 
@@ -304,9 +343,13 @@ class QuickTerminalController: BaseTerminalController {
         }
 
         // If its the root, we check if the process exited. If it did,
-        // then we do empty the tree.
+        // then we close the current tab or empty the tree.
         if surface.processExited {
-            surfaceTree = .init()
+            if let currentTab = tabManager.currentTab {
+                tabManager.closeTab(currentTab)
+            } else {
+                surfaceTree = .init()
+            }
             return
         }
 
@@ -359,6 +402,13 @@ class QuickTerminalController: BaseTerminalController {
                 surfaceTree = tree
                 let view = tree.first(where: { $0.id.uuidString == restorationState?.focusedSurface }) ?? tree.first!
                 focusedSurface = view
+
+                // Create initial tab for restored tree
+                let initialTab = QuickTerminalTab(surfaceTree: tree)
+                initialTab.isActive = true
+                tabManager.tabs.append(initialTab)
+                tabManager.currentTab = initialTab
+
                 // Add a short delay to check if the correct surface is focused.
                 // Each SurfaceWrapper defaults its FocusedValue to itself; without this delay,
                 // the tree often focuses the first surface instead of the intended one.
@@ -373,8 +423,15 @@ class QuickTerminalController: BaseTerminalController {
                 config.environmentVariables["GHOSTTY_QUICK_TERMINAL"] = "1"
 
                 let view = Ghostty.SurfaceView(ghostty_app, baseConfig: config)
-                surfaceTree = SplitTree(view: view)
+                let tree = SplitTree(view: view)
+                surfaceTree = tree
                 focusedSurface = view
+
+                // Create initial tab
+                let initialTab = QuickTerminalTab(surfaceTree: tree)
+                initialTab.isActive = true
+                tabManager.tabs.append(initialTab)
+                tabManager.currentTab = initialTab
             }
         }
 
@@ -629,15 +686,20 @@ class QuickTerminalController: BaseTerminalController {
         terminalViewContainer?.ghosttyConfigDidChange(ghostty.config, preferredBackgroundColor: nil)
     }
 
-    private func showNoNewTabAlert() {
-        guard let window else { return }
-        let alert = NSAlert()
-        alert.messageText = "Cannot Create New Tab"
-        alert.informativeText = "Tabs aren't supported in the Quick Terminal."
-        alert.addButton(withTitle: "OK")
-        alert.alertStyle = .warning
-        alert.beginSheetModal(for: window)
+    func updateSurfaceTree(to newTree: SplitTree<Ghostty.SurfaceView>) {
+        self.surfaceTree = newTree
+        if let view = newTree.first {
+            self.focusedSurface = view
+            guard let window = self.window, self.focusedSurface?.window == window else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(25)) {
+                    self.updateSurfaceTree(to: newTree)
+                }
+                return
+            }
+            makeWindowKey(window, retries: 10)
+        }
     }
+
     // MARK: First Responder
 
     @IBAction override func closeWindow(_ sender: Any) {
@@ -646,7 +708,7 @@ class QuickTerminalController: BaseTerminalController {
     }
 
     @IBAction func newTab(_ sender: Any?) {
-        showNoNewTabAlert()
+        tabManager.newTab()
     }
 
     @IBAction func toggleGhosttyFullScreen(_ sender: Any) {
@@ -718,8 +780,9 @@ class QuickTerminalController: BaseTerminalController {
         guard let surfaceView = notification.object as? Ghostty.SurfaceView else { return }
         guard let window = surfaceView.window else { return }
         guard window.windowController is QuickTerminalController else { return }
-        // Tabs aren't supported with Quick Terminals or derivatives
-        showNoNewTabAlert()
+        
+        // Create a new tab
+        tabManager.newTab()
     }
 
     private struct DerivedConfig {
