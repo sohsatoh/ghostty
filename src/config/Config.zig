@@ -2781,6 +2781,24 @@ keybind: Keybinds = .{},
 /// Only implemented on macOS.
 @"quick-terminal-tab-bar": QuickTerminalTabBar = .top,
 
+/// The width of the vertical tab bar in points when `quick-terminal-tab-bar`
+/// is set to `left` or `right`. Has no effect when the tab bar is `top` or
+/// `hidden`.
+///
+/// Default: 160
+///
+/// Only implemented on macOS.
+@"quick-terminal-tab-bar-width": u32 = 160,
+
+/// Whether to wrap long tab titles in the quick terminal tab bar instead
+/// of truncating them. When enabled, tab titles will wrap to multiple
+/// lines so the full title is visible.
+///
+/// Default: false
+///
+/// Only implemented on macOS.
+@"quick-terminal-tab-wrap": bool = false,
+
 /// Whether to enable shell integration auto-injection or not. Shell integration
 /// greatly enhances the terminal experience by enabling a number of features:
 ///

@@ -595,6 +595,22 @@ extension Ghostty {
             return QuickTerminalTabBarPosition(fromGhosttyConfig: str) ?? .top
         }
 
+        var quickTerminalTabBarWidth: UInt32 {
+            guard let config = self.config else { return 160 }
+            var v: UInt32 = 160
+            let key = "quick-terminal-tab-bar-width"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
+        var quickTerminalTabWrap: Bool {
+            guard let config = self.config else { return false }
+            var v = false
+            let key = "quick-terminal-tab-wrap"
+            _ = ghostty_config_get(config, &v, key, UInt(key.lengthOfBytes(using: .utf8)))
+            return v
+        }
+
         var quickTerminalSpaceBehavior: QuickTerminalSpaceBehavior {
             guard let config = self.config else { return .move }
             var v: UnsafePointer<Int8>?

@@ -168,7 +168,9 @@ class QuickTerminalController: BaseTerminalController {
 
         let tabBar = QuickTerminalTabBarView(
             tabManager: tabManager,
-            tabBarPosition: derivedConfig.quickTerminalTabBar
+            tabBarPosition: derivedConfig.quickTerminalTabBar,
+            tabBarWidth: derivedConfig.quickTerminalTabBarWidth,
+            tabWrap: derivedConfig.quickTerminalTabWrap
         )
         let terminal = TerminalView(
             ghostty: ghostty,
@@ -849,6 +851,8 @@ class QuickTerminalController: BaseTerminalController {
         let quickTerminalSpaceBehavior: QuickTerminalSpaceBehavior
         let quickTerminalSize: QuickTerminalSize
         let quickTerminalTabBar: QuickTerminalTabBarPosition
+        let quickTerminalTabBarWidth: CGFloat
+        let quickTerminalTabWrap: Bool
         let backgroundOpacity: Double
         let backgroundBlur: Ghostty.Config.BackgroundBlur
 
@@ -859,6 +863,8 @@ class QuickTerminalController: BaseTerminalController {
             self.quickTerminalSpaceBehavior = .move
             self.quickTerminalSize = QuickTerminalSize()
             self.quickTerminalTabBar = .top
+            self.quickTerminalTabBarWidth = 160
+            self.quickTerminalTabWrap = false
             self.backgroundOpacity = 1.0
             self.backgroundBlur = .disabled
         }
@@ -870,6 +876,8 @@ class QuickTerminalController: BaseTerminalController {
             self.quickTerminalSpaceBehavior = config.quickTerminalSpaceBehavior
             self.quickTerminalSize = config.quickTerminalSize
             self.quickTerminalTabBar = config.quickTerminalTabBar
+            self.quickTerminalTabBarWidth = CGFloat(config.quickTerminalTabBarWidth)
+            self.quickTerminalTabWrap = config.quickTerminalTabWrap
             self.backgroundOpacity = config.backgroundOpacity
             self.backgroundBlur = config.backgroundBlur
         }

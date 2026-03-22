@@ -3,6 +3,8 @@ import SwiftUI
 struct QuickTerminalTabBarView: View {
     @ObservedObject var tabManager: QuickTerminalTabManager
     let tabBarPosition: QuickTerminalTabBarPosition
+    let tabBarWidth: CGFloat
+    let tabWrap: Bool
 
     var body: some View {
         switch tabBarPosition {
@@ -49,7 +51,7 @@ struct QuickTerminalTabBarView: View {
             newTabButton
                 .frame(height: 32)
         }
-        .frame(width: 160)
+        .frame(width: tabBarWidth)
         .background(Color(NSColor.controlBackgroundColor))
     }
 
@@ -59,6 +61,7 @@ struct QuickTerminalTabBarView: View {
             tabNumber: index + 1,
             isHighlighted: tab.isActive,
             isVertical: tabBarPosition.isVertical,
+            tabWrap: tabWrap,
             onSelect: { tabManager.selectTab(tab) },
             onClose: { tabManager.closeTab(tab) }
         )

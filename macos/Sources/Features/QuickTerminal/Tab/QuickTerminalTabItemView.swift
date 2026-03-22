@@ -5,6 +5,7 @@ struct QuickTerminalTabItemView: View {
     let tabNumber: Int
     let isHighlighted: Bool
     let isVertical: Bool
+    let tabWrap: Bool
     let onSelect: () -> Void
     let onClose: () -> Void
 
@@ -29,7 +30,7 @@ struct QuickTerminalTabItemView: View {
             VStack(alignment: .leading, spacing: 1) {
                 Text(tab.title)
                     .foregroundColor(isHighlighted ? .primary : .secondary)
-                    .lineLimit(1)
+                    .lineLimit(tabWrap ? nil : 1)
                     .truncationMode(.tail)
 
                 if let displayPwd = tab.displayPwd {
@@ -43,7 +44,8 @@ struct QuickTerminalTabItemView: View {
             .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 8)
-        .frame(height: tab.displayPwd != nil ? 44 : 32)
+        .padding(.vertical, tabWrap ? 6 : 0)
+        .frame(minHeight: tab.displayPwd != nil ? 44 : 32)
         .frame(maxWidth: isVertical ? .infinity : nil)
         .background(
             Rectangle()
