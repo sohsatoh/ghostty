@@ -2,7 +2,9 @@ import SwiftUI
 
 struct QuickTerminalTabItemView: View {
     @ObservedObject var tab: QuickTerminalTab
+    let tabNumber: Int
     let isHighlighted: Bool
+    let isVertical: Bool
     let onSelect: () -> Void
     let onClose: () -> Void
 
@@ -19,14 +21,19 @@ struct QuickTerminalTabItemView: View {
             .opacity(isHovered ? 1 : 0)
             .animation(.easeInOut, value: isHovered)
 
+            Text("\(tabNumber)")
+                .font(.system(size: 11, weight: .medium, design: .monospaced))
+                .foregroundColor(isHighlighted ? .primary : .secondary)
+
             Text(tab.title)
                 .foregroundColor(isHighlighted ? .primary : .secondary)
                 .lineLimit(1)
                 .truncationMode(.tail)
-                .frame(minWidth: 0, maxWidth: .infinity)
+                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 8)
         .frame(height: 32)
+        .frame(maxWidth: isVertical ? .infinity : nil)
         .background(
             Rectangle()
                 .fill(
