@@ -25,14 +25,24 @@ struct QuickTerminalTabItemView: View {
                 .font(.system(size: 11, weight: .medium, design: .monospaced))
                 .foregroundColor(isHighlighted ? .primary : .secondary)
 
-            Text(tab.title)
-                .foregroundColor(isHighlighted ? .primary : .secondary)
-                .lineLimit(1)
-                .truncationMode(.tail)
-                .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(tab.title)
+                    .foregroundColor(isHighlighted ? .primary : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+
+                if let displayPwd = tab.displayPwd {
+                    Text(displayPwd)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            .frame(minWidth: 0, maxWidth: .infinity, alignment: .leading)
         }
         .padding(.horizontal, 8)
-        .frame(height: 32)
+        .frame(height: tab.displayPwd != nil ? 44 : 32)
         .frame(maxWidth: isVertical ? .infinity : nil)
         .background(
             Rectangle()
