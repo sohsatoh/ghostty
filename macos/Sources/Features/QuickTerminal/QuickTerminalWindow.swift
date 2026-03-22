@@ -44,4 +44,23 @@ class QuickTerminalWindow: NSPanel {
         // https://github.com/ghostty-org/ghostty/pull/8026
         super.setFrame(initialFrame ?? frameRect, display: flag)
     }
+
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Intercept Cmd+1 through Cmd+9 for quick terminal tab switching
+        if event.modifierFlags.contains(.command),
+           !event.modifierFlags.contains(.shift),
+           !event.modifierFlags.contains(.option),
+           !event.modifierFlags.contains(.control),
+           let chars = event.charactersIgnoringModifiers,
+           let digit = Int(chars),
+           digit >= 1, digit <= 9 {
+            guard let controller = self.windowController as? QuickTerminalController else {
+                return super.performKeyEquivalent(with: event)
+            }
+            controller.gotoTab(index: digit)
+            return true
+        }
+
+        return super.performKeyEquivalent(with: event)
+    }
 }

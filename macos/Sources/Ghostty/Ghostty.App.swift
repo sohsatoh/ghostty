@@ -1136,7 +1136,13 @@ extension Ghostty {
 
                     // Similar to goto_split (see comment there) about our performability,
                     // we should make this more accurate later.
-                    guard (surfaceView.window?.tabGroup?.windows.count ?? 0) > 1 else { return false }
+                    // Quick terminal manages its own tabs outside of native tab groups,
+                    // so we skip the tab group check for quick terminal windows.
+                    if surfaceView.window?.windowController is QuickTerminalController {
+                        // Always allow for quick terminal
+                    } else {
+                        guard (surfaceView.window?.tabGroup?.windows.count ?? 0) > 1 else { return false }
+                    }
 
                     NotificationCenter.default.post(
                         name: Notification.ghosttyGotoTab,

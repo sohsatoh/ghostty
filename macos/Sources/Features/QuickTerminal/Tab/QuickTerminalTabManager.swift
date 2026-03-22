@@ -125,6 +125,11 @@ class QuickTerminalTabManager: ObservableObject {
             selectNextTab()
         } else if tabIndex == GHOSTTY_GOTO_TAB_LAST.rawValue {
             selectTab(tabs[tabs.count - 1])
+        } else if tabIndex > 0 {
+            // 1-indexed tab number, clamp to last tab if out of range
+            let targetIndex = min(Int(tabIndex - 1), tabs.count - 1)
+            guard targetIndex >= 0 else { return }
+            selectTab(tabs[targetIndex])
         } else {
             return
         }
