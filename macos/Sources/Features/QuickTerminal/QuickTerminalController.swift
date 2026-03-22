@@ -166,16 +166,42 @@ class QuickTerminalController: BaseTerminalController {
             qtWindow.initialFrame = nil
         }
 
-        let mainContent = VStack(spacing: 0) {
-            QuickTerminalTabBarView(tabManager: tabManager)
-            TerminalView(
-                ghostty: ghostty,
-                viewModel: self,
-                delegate: self
-            )
-        }
+        let tabBar = QuickTerminalTabBarView(
+            tabManager: tabManager,
+            tabBarPosition: derivedConfig.quickTerminalTabBar
+        )
+        let terminal = TerminalView(
+            ghostty: ghostty,
+            viewModel: self,
+            delegate: self
+        )
 
-        window.contentView = NSHostingView(rootView: mainContent)
+        switch derivedConfig.quickTerminalTabBar {
+        case .top:
+            let mainContent = VStack(spacing: 0) {
+                tabBar
+                terminal
+            }
+            window.contentView = NSHostingView(rootView: mainContent)
+
+        case .left:
+            let mainContent = HStack(spacing: 0) {
+                tabBar
+                terminal
+            }
+            window.contentView = NSHostingView(rootView: mainContent)
+
+        case .right:
+            let mainContent = HStack(spacing: 0) {
+                terminal
+                tabBar
+            }
+            window.contentView = NSHostingView(rootView: mainContent)
+
+        case .hidden:
+            let mainContent = terminal
+            window.contentView = NSHostingView(rootView: mainContent)
+        }
     }
 
     // MARK: NSWindowDelegate
@@ -711,6 +737,15 @@ class QuickTerminalController: BaseTerminalController {
         tabManager.newTab()
     }
 
+    /// Switch to a tab by 1-based index. Called from QuickTerminalWindow's
+    /// performKeyEquivalent for Cmd+number shortcuts.
+    func gotoTab(index: Int) {
+        guard !tabManager.tabs.isEmpty else { return }
+        let targetIndex = min(index - 1, tabManager.tabs.count - 1)
+        guard targetIndex >= 0 else { return }
+        tabManager.selectTab(tabManager.tabs[targetIndex])
+    }
+
     @IBAction func toggleGhosttyFullScreen(_ sender: Any) {
         guard let surface = focusedSurface?.surface else { return }
         ghostty.toggleFullscreen(surface: surface)
@@ -791,6 +826,7 @@ class QuickTerminalController: BaseTerminalController {
         let quickTerminalAutoHide: Bool
         let quickTerminalSpaceBehavior: QuickTerminalSpaceBehavior
         let quickTerminalSize: QuickTerminalSize
+        let quickTerminalTabBar: QuickTerminalTabBarPosition
         let backgroundOpacity: Double
         let backgroundBlur: Ghostty.Config.BackgroundBlur
 
@@ -800,6 +836,7 @@ class QuickTerminalController: BaseTerminalController {
             self.quickTerminalAutoHide = true
             self.quickTerminalSpaceBehavior = .move
             self.quickTerminalSize = QuickTerminalSize()
+            self.quickTerminalTabBar = .top
             self.backgroundOpacity = 1.0
             self.backgroundBlur = .disabled
         }
@@ -810,6 +847,7 @@ class QuickTerminalController: BaseTerminalController {
             self.quickTerminalAutoHide = config.quickTerminalAutoHide
             self.quickTerminalSpaceBehavior = config.quickTerminalSpaceBehavior
             self.quickTerminalSize = config.quickTerminalSize
+            self.quickTerminalTabBar = config.quickTerminalTabBar
             self.backgroundOpacity = config.backgroundOpacity
             self.backgroundBlur = config.backgroundBlur
         }
