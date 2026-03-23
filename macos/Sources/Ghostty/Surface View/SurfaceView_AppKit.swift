@@ -30,7 +30,22 @@ extension Ghostty {
         @Published var pwd: String?
 
         // Whether a command is currently running in this surface (OSC 133C/D).
-        @Published var commandRunning: Bool = false
+        // Automatically clears after a timeout to handle interactive programs
+        // (e.g. claude) that never send OSC 133;D until exit.
+        @Published var commandRunning: Bool = false {
+            didSet {
+                commandRunningTimeout?.cancel()
+                commandRunningTimeout = nil
+                if commandRunning {
+                    let work = DispatchWorkItem { [weak self] in
+                        self?.commandRunning = false
+                    }
+                    commandRunningTimeout = work
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 30, execute: work)
+                }
+            }
+        }
+        private var commandRunningTimeout: DispatchWorkItem?
 
         // The cell size of this surface. This is set by the core when the
         // surface is first created and any time the cell size changes (i.e.

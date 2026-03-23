@@ -1097,13 +1097,20 @@ pub const StreamHandler = struct {
                 self.surfaceMessageWriter(.{ .stop_command = code });
             },
 
+            // A new prompt implies any previous command has ended.
+            // Send stop_command to clear command-running state for cases
+            // where 133;D was never sent (e.g. interactive programs).
+            // This is safe when no command is running: Surface handles
+            // stop_command as a no-op if command_timer is null.
+            .fresh_line_new_prompt,
+            .new_command,
+            .prompt_start,
+            => self.surfaceMessageWriter(.{ .stop_command = null }),
+
             // Handled by Terminal, no special handling by us
             .end_prompt_start_input,
             .end_prompt_start_input_terminate_eol,
             .fresh_line,
-            .fresh_line_new_prompt,
-            .new_command,
-            .prompt_start,
             => {},
         }
 
