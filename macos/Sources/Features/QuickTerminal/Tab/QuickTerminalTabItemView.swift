@@ -37,7 +37,7 @@ struct QuickTerminalTabItemView: View {
                     Text(displayPwd)
                         .font(.system(size: 10))
                         .foregroundColor(.secondary)
-                        .lineLimit(1)
+                        .lineLimit(tabWrap ? nil : 1)
                         .truncationMode(.middle)
                 }
             }
