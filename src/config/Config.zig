@@ -2763,6 +2763,42 @@ keybind: Keybinds = .{},
 /// Available since: 1.2.0
 @"quick-terminal-keyboard-interactivity": QuickTerminalKeyboardInteractivity = .@"on-demand",
 
+/// Controls the position of the tab bar in the quick terminal.
+///
+/// Valid values are:
+///
+///  * `top` (default) - Tabs are displayed horizontally at the top of the
+///    quick terminal.
+///
+///  * `left` - Tabs are displayed vertically on the left side of the
+///    quick terminal.
+///
+///  * `right` - Tabs are displayed vertically on the right side of the
+///    quick terminal.
+///
+///  * `hidden` - The tab bar is hidden.
+///
+/// Only implemented on macOS.
+@"quick-terminal-tab-bar": QuickTerminalTabBar = .top,
+
+/// The width of the vertical tab bar in points when `quick-terminal-tab-bar`
+/// is set to `left` or `right`. Has no effect when the tab bar is `top` or
+/// `hidden`.
+///
+/// Default: 160
+///
+/// Only implemented on macOS.
+@"quick-terminal-tab-bar-width": u32 = 160,
+
+/// Whether to wrap long tab titles in the quick terminal tab bar instead
+/// of truncating them. When enabled, tab titles will wrap to multiple
+/// lines so the full title is visible.
+///
+/// Default: false
+///
+/// Only implemented on macOS.
+@"quick-terminal-tab-wrap": bool = false,
+
 /// Whether to enable shell integration auto-injection or not. Shell integration
 /// greatly enhances the terminal experience by enabling a number of features:
 ///
@@ -9528,6 +9564,14 @@ pub const QuickTerminalKeyboardInteractivity = enum {
     none,
     @"on-demand",
     exclusive,
+};
+
+/// See quick-terminal-tab-bar
+pub const QuickTerminalTabBar = enum {
+    top,
+    left,
+    right,
+    hidden,
 };
 
 /// See grapheme-width-method

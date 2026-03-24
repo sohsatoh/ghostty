@@ -169,6 +169,7 @@
 				Features/QuickTerminal/QuickTerminalScreenStateCache.swift,
 				Features/QuickTerminal/QuickTerminalSize.swift,
 				Features/QuickTerminal/QuickTerminalSpaceBehavior.swift,
+				Features/QuickTerminal/QuickTerminalTabBarPosition.swift,
 				Features/QuickTerminal/QuickTerminalWindow.swift,
 				Features/QuickTerminal/Tab/QuickTerminalTab.swift,
 				Features/QuickTerminal/Tab/QuickTerminalTabBarView.swift,

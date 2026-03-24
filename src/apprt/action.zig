@@ -318,6 +318,9 @@ pub const Action = union(Key) {
     /// Show the on-screen keyboard.
     show_on_screen_keyboard,
 
+    /// A command has started running (OSC 133C received).
+    command_started,
+
     /// A command has finished,
     command_finished: CommandFinished,
 
@@ -403,6 +406,7 @@ pub const Action = union(Key) {
         show_child_exited,
         progress_report,
         show_on_screen_keyboard,
+        command_started,
         command_finished,
         start_search,
         end_search,

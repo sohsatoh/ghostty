@@ -166,16 +166,44 @@ class QuickTerminalController: BaseTerminalController {
             qtWindow.initialFrame = nil
         }
 
-        let mainContent = VStack(spacing: 0) {
-            QuickTerminalTabBarView(tabManager: tabManager)
-            TerminalView(
-                ghostty: ghostty,
-                viewModel: self,
-                delegate: self
-            )
-        }
+        let tabBar = QuickTerminalTabBarView(
+            tabManager: tabManager,
+            tabBarPosition: derivedConfig.quickTerminalTabBar,
+            tabBarWidth: derivedConfig.quickTerminalTabBarWidth,
+            tabWrap: derivedConfig.quickTerminalTabWrap
+        )
+        let terminal = TerminalView(
+            ghostty: ghostty,
+            viewModel: self,
+            delegate: self
+        )
 
-        window.contentView = NSHostingView(rootView: mainContent)
+        switch derivedConfig.quickTerminalTabBar {
+        case .top:
+            let mainContent = VStack(spacing: 0) {
+                tabBar
+                terminal
+            }
+            window.contentView = NSHostingView(rootView: mainContent)
+
+        case .left:
+            let mainContent = HStack(spacing: 0) {
+                tabBar
+                terminal
+            }
+            window.contentView = NSHostingView(rootView: mainContent)
+
+        case .right:
+            let mainContent = HStack(spacing: 0) {
+                terminal
+                tabBar
+            }
+            window.contentView = NSHostingView(rootView: mainContent)
+
+        case .hidden:
+            let mainContent = terminal
+            window.contentView = NSHostingView(rootView: mainContent)
+        }
     }
 
     // MARK: NSWindowDelegate
@@ -711,6 +739,37 @@ class QuickTerminalController: BaseTerminalController {
         tabManager.newTab()
     }
 
+    /// Find a surface view by UUID across all quick terminal tabs.
+    /// Returns the surface and the tab it belongs to, or nil if not found.
+    func findSurface(forUUID uuid: UUID) -> (surface: Ghostty.SurfaceView, tab: QuickTerminalTab)? {
+        for tab in tabManager.tabs {
+            for view in tab.surfaceTree where view.id == uuid {
+                return (view, tab)
+            }
+        }
+        return nil
+    }
+
+    /// Show the quick terminal and switch to the tab containing the given surface.
+    /// Returns true if the surface was found and the tab was activated.
+    func showSurface(forUUID uuid: UUID) -> Bool {
+        guard let result = findSurface(forUUID: uuid) else { return false }
+        tabManager.selectTab(result.tab)
+        if !visible {
+            animateIn()
+        }
+        return true
+    }
+
+    /// Switch to a tab by 1-based index. Called from QuickTerminalWindow's
+    /// performKeyEquivalent for Cmd+number shortcuts.
+    func gotoTab(index: Int) {
+        guard !tabManager.tabs.isEmpty else { return }
+        let targetIndex = min(index - 1, tabManager.tabs.count - 1)
+        guard targetIndex >= 0 else { return }
+        tabManager.selectTab(tabManager.tabs[targetIndex])
+    }
+
     @IBAction func toggleGhosttyFullScreen(_ sender: Any) {
         guard let surface = focusedSurface?.surface else { return }
         ghostty.toggleFullscreen(surface: surface)
@@ -791,6 +850,9 @@ class QuickTerminalController: BaseTerminalController {
         let quickTerminalAutoHide: Bool
         let quickTerminalSpaceBehavior: QuickTerminalSpaceBehavior
         let quickTerminalSize: QuickTerminalSize
+        let quickTerminalTabBar: QuickTerminalTabBarPosition
+        let quickTerminalTabBarWidth: CGFloat
+        let quickTerminalTabWrap: Bool
         let backgroundOpacity: Double
         let backgroundBlur: Ghostty.Config.BackgroundBlur
 
@@ -800,6 +862,9 @@ class QuickTerminalController: BaseTerminalController {
             self.quickTerminalAutoHide = true
             self.quickTerminalSpaceBehavior = .move
             self.quickTerminalSize = QuickTerminalSize()
+            self.quickTerminalTabBar = .top
+            self.quickTerminalTabBarWidth = 160
+            self.quickTerminalTabWrap = false
             self.backgroundOpacity = 1.0
             self.backgroundBlur = .disabled
         }
@@ -810,6 +875,9 @@ class QuickTerminalController: BaseTerminalController {
             self.quickTerminalAutoHide = config.quickTerminalAutoHide
             self.quickTerminalSpaceBehavior = config.quickTerminalSpaceBehavior
             self.quickTerminalSize = config.quickTerminalSize
+            self.quickTerminalTabBar = config.quickTerminalTabBar
+            self.quickTerminalTabBarWidth = CGFloat(config.quickTerminalTabBarWidth)
+            self.quickTerminalTabWrap = config.quickTerminalTabWrap
             self.backgroundOpacity = config.backgroundOpacity
             self.backgroundBlur = config.backgroundBlur
         }
