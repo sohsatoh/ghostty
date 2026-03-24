@@ -36,6 +36,7 @@ const App = @import("App.zig");
 const internal_os = @import("os/main.zig");
 const inspectorpkg = @import("inspector/main.zig");
 const SurfaceMouse = @import("surface_mouse.zig");
+const ProcessInfo = @import("pty.zig").ProcessInfo;
 
 const log = std.log.scoped(.surface);
 
@@ -4809,14 +4810,14 @@ fn mouseSelection(
         break :ebs drag_pin.before(click_pin);
     };
 
-    // Whether or not the the click pin cell
+    // Whether or not the click pin cell
     // should be included in the selection.
     const include_click_cell = if (end_before_start)
         click_x_frac >= threshold_point
     else
         click_x_frac < threshold_point;
 
-    // Whether or not the the drag pin cell
+    // Whether or not the drag pin cell
     // should be included in the selection.
     const include_drag_cell = if (end_before_start)
         drag_x_frac < threshold_point
@@ -6347,6 +6348,13 @@ fn testMouseSelectionIsNull(
             size,
         ),
     );
+}
+
+/// Get information about the process(es) running within the surface. Returns
+/// `null` if there was an error getting the information or the information is
+/// not available on a particular platform.
+pub fn getProcessInfo(self: *Surface, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+    return self.io.getProcessInfo(info);
 }
 
 test "Surface: selection logic" {

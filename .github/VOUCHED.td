@@ -45,7 +45,6 @@ bitigchi
 bkircher
 bo2themax
 brentschroeter
-cadebrown
 cespare
 charliie-dev
 chernetskyi
@@ -60,6 +59,7 @@ damyanbogoev
 danulqua
 dariogriffo
 davidsanchez222
+deblasis
 dervedro
 devsunb
 diaaeddin
@@ -69,6 +69,7 @@ douglance
 douglas
 drepper
 dzhlobo
+ekaterinepapava
 elias8
 ephemera
 eriksremess
@@ -84,6 +85,10 @@ gpanders
 guilhermetk
 hakonhagland
 halosatrio
+heaths
+heddxh heddxh
+-highimpact-dev Disrespectful AI user
+hlcfan
 hqnna
 hulet
 icodesign
@@ -104,6 +109,7 @@ khipp
 kirwiisp
 kjvdven
 kloneets
+-kody-w
 koranir
 kristina8888
 kristofersoler
@@ -111,11 +117,14 @@ laxystem
 liby
 linustalacko
 lonsagisawa
+luisnquin
+lynicis
 mac0ne
 mahnokropotkinvich
 marijagjorgjieva
 markdorison
 markhuot
+marler8997
 marrocco-simone
 matkotiric
 micaeljarniac
@@ -143,6 +152,7 @@ pangoraw
 pauley-unsaturated
 peilingjiang
 peterdavehello
+philocalyst
 phush0
 piedrahitac
 pluiedev
@@ -164,15 +174,19 @@ seruman
 silveirapf
 slsrepo
 sunshine-syz
+tdgroot
 tdslot
 ticclick
 tnagatomi
 trag1c
 tristan957
+turbolent
 tweedbeetle
 uhojin
+unphased
 uzaaft
 vaughanandrews
+viruslobster
 vlsi
 wyounas
 yamshta

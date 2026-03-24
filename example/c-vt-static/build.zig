@@ -24,12 +24,14 @@ pub fn build(b: *std.Build) void {
         // always keep simd enabled.
         // .simd = false,
     })) |dep| {
-        exe_mod.linkLibrary(dep.artifact("ghostty-vt"));
+        // Use "ghostty-vt-static" for static linking instead of
+        // "ghostty-vt" which provides a shared library.
+        exe_mod.linkLibrary(dep.artifact("ghostty-vt-static"));
     }
 
     // Exe
     const exe = b.addExecutable(.{
-        .name = "c_vt_mouse_encode",
+        .name = "c_vt_static",
         .root_module = exe_mod,
     });
     b.installArtifact(exe);

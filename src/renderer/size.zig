@@ -1,10 +1,21 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-const configpkg = @import("../config.zig");
-const font = @import("../font/main.zig");
-const terminal = @import("../terminal/main.zig");
+const terminal_size = @import("../terminal/size.zig");
 
 const log = std.log.scoped(.renderer_size);
+
+/// Controls how extra whitespace around the terminal grid is distributed.
+pub const PaddingBalance = enum {
+    /// No balancing; padding is applied as specified explicitly.
+    false,
+    /// Balances padding but caps the top padding so the first row doesn't
+    /// drift too far from the top of the window. Excess vertical space is
+    /// shifted to the bottom.
+    true,
+    /// Distributes leftover space equally on all sides so the grid is
+    /// centered within the screen.
+    equal,
+};
 
 /// All relevant sizes for a rendered terminal. These are all the sizes that
 /// any functionality should need to know about the terminal in order to
@@ -38,7 +49,7 @@ pub const Size = struct {
     pub fn balancePadding(
         self: *Size,
         explicit: Padding,
-        mode: configpkg.Config.WindowPaddingBalance,
+        mode: PaddingBalance,
     ) void {
         // This ensure grid() does the right thing
         self.padding = explicit;
@@ -225,7 +236,7 @@ pub const ScreenSize = extern struct {
 
 /// The dimensions of the grid itself, in rows/columns units.
 pub const GridSize = extern struct {
-    pub const Unit = terminal.size.CellCountInt;
+    pub const Unit = terminal_size.CellCountInt;
 
     columns: Unit = 0,
     rows: Unit = 0,

@@ -9,6 +9,7 @@ const OptionAsAlt = @import("../../input/config.zig").OptionAsAlt;
 const Result = @import("result.zig").Result;
 const KeyEvent = @import("key_event.zig").Event;
 const Terminal = @import("terminal.zig").Terminal;
+const ZigTerminal = @import("../Terminal.zig");
 
 const log = std.log.scoped(.key_encode);
 
@@ -121,7 +122,7 @@ pub fn setopt_from_terminal(
     terminal_: Terminal,
 ) callconv(.c) void {
     const wrapper = encoder_ orelse return;
-    const t = terminal_ orelse return;
+    const t: *ZigTerminal = (terminal_ orelse return).terminal;
     wrapper.opts = .fromTerminal(t);
 }
 
@@ -152,7 +153,7 @@ pub fn encode(
             // Discarding always uses a u64. If we're on 32-bit systems
             // we cast down. We should make this safer in the future.
             out_written.* = @intCast(discarding.count);
-            return .out_of_memory;
+            return .out_of_space;
         },
     };
 
@@ -258,7 +259,7 @@ test "setopt_from_terminal" {
 
     // Options should reflect defaults from a fresh terminal
     try testing.expect(!e.?.opts.cursor_key_application);
-    try testing.expect(!e.?.opts.alt_esc_prefix);
+    try testing.expect(e.?.opts.alt_esc_prefix);
     try testing.expectEqual(KittyFlags.disabled, e.?.opts.kitty_flags);
     try testing.expectEqual(OptionAsAlt.false, e.?.opts.macos_option_as_alt);
 }
@@ -329,7 +330,7 @@ test "encode: kitty ctrl release with ctrl mod set" {
 
     // Encode null should give us the length required
     var required: usize = 0;
-    try testing.expectEqual(Result.out_of_memory, encode(
+    try testing.expectEqual(Result.out_of_space, encode(
         encoder,
         event,
         null,
