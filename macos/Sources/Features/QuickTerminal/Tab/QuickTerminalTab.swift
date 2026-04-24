@@ -4,6 +4,9 @@ import Combine
 class QuickTerminalTab: ObservableObject, Identifiable {
     let id = UUID()
     var surfaceTree: SplitTree<Ghostty.SurfaceView>
+    /// Last focused surface in this tab, used to restore focus on tab re-selection.
+    /// Weak so it auto-nils when a pane is closed and no longer retained by the tree.
+    weak var focusedSurface: Ghostty.SurfaceView?
     @Published var title: String
     @Published var pwd: String?
     @Published var commandRunning: Bool = false
