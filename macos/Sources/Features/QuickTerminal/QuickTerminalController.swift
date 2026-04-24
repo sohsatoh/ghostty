@@ -327,6 +327,10 @@ class QuickTerminalController: BaseTerminalController {
     override func surfaceTreeDidChange(from: SplitTree<Ghostty.SurfaceView>, to: SplitTree<Ghostty.SurfaceView>) {
         super.surfaceTreeDidChange(from: from, to: to)
 
+        // Keep the current tab's cached tree in sync so splits (and any other
+        // tree mutations) persist across tab switches.
+        tabManager.currentTab?.surfaceTree = to
+
         // If our surface tree is empty then check if we have tabs with invalid surfaces
         if to.isEmpty {
             // Check if any tabs have surfaces that are now invalid (closed)
@@ -714,13 +718,25 @@ class QuickTerminalController: BaseTerminalController {
         terminalViewContainer?.ghosttyConfigDidChange(ghostty.config, preferredBackgroundColor: nil)
     }
 
-    func updateSurfaceTree(to newTree: SplitTree<Ghostty.SurfaceView>) {
+    func updateSurfaceTree(
+        to newTree: SplitTree<Ghostty.SurfaceView>,
+        focus preferredFocus: Ghostty.SurfaceView? = nil
+    ) {
         self.surfaceTree = newTree
-        if let view = newTree.first {
+        // Prefer the caller-specified surface (e.g. restored from the
+        // selected tab), falling back to the first pane when the hint is
+        // missing or no longer in the tree.
+        let view: Ghostty.SurfaceView? = {
+            if let preferredFocus, newTree.contains(preferredFocus) {
+                return preferredFocus
+            }
+            return newTree.first
+        }()
+        if let view {
             self.focusedSurface = view
             guard let window = self.window, self.focusedSurface?.window == window else {
                 DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(25)) {
-                    self.updateSurfaceTree(to: newTree)
+                    self.updateSurfaceTree(to: newTree, focus: preferredFocus)
                 }
                 return
             }

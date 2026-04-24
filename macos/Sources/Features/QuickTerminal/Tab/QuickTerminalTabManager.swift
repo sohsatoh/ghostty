@@ -31,11 +31,15 @@ class QuickTerminalTabManager: ObservableObject {
     func selectTab(_ tab: QuickTerminalTab) {
         guard currentTab?.id != tab.id else { return }  // Avoid unnecessary updates
 
+        // Remember which pane is focused in the outgoing tab so we can
+        // restore it when the user switches back.
+        currentTab?.focusedSurface = controller?.focusedSurface
+
         currentTab?.isActive = false
         tab.isActive = true
         currentTab = tab
 
-        controller?.updateSurfaceTree(to: tab.surfaceTree)
+        controller?.updateSurfaceTree(to: tab.surfaceTree, focus: tab.focusedSurface)
     }
 
     func closeTab(_ tab: QuickTerminalTab) {
